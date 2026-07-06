@@ -87,3 +87,8 @@ are cheap.
 - A resync (Microsoft Graph occasionally invalidates a delta token) re-walks
   that one root from scratch; already-indexed unchanged files are skipped by
   eTag, so this is cheap but not instant on a large root.
+- Folders shared from another user's drive are addressed through
+  `/me/drive/items/{id}` without resolving the remote drive id (same as the
+  legacy connector); whether Graph transparently follows the remote item
+  depends on the account type, so some work/school shared folders may not
+  enumerate.
