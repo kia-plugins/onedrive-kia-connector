@@ -4,7 +4,7 @@
  * Microsoft Graph's `/drive/items/{id}/delta` feed for both the initial
  * backfill AND every later poll, and a pure toDocument.
  *
- * Ported from alpha-cent's v1 connector (`git show
+ * Ported from the v1 connector (`git show
  * main:src/main/connectors/onedrive/<file>.ts`): backfill.ts's per-root
  * enumerate-to-deltaLink loop, delta.ts's per-root poll + 410-resync
  * recovery, ingest.ts's routing / hash-skip / downloadUrl-refresh-and-retry,

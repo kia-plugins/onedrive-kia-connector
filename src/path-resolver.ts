@@ -1,5 +1,5 @@
 /**
- * v2 port of v1 `path-resolver.ts` (alpha-cent `git show
+ * v2 port of v1 `path-resolver.ts` (v1 repo `git show
  * main:src/main/connectors/onedrive/path-resolver.ts`), verbatim algorithm.
  *
  * Pure-local: Microsoft Graph carries `parentReference.path` on every

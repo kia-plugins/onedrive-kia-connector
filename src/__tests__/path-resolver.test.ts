@@ -1,5 +1,5 @@
 /**
- * Direct port of alpha-cent's onedrive-path-resolver.test.ts — same
+ * Direct port of the v1 repo's onedrive-path-resolver.test.ts — same
  * scenarios, `rootName` replacing v1's `display_path` field name (v2's
  * RootConfig shape).
  */
