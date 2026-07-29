@@ -1,15 +1,20 @@
 /**
- * Shared offline test harness: scripted host-shaped fetch responses (status /
- * statusText / lowercase headers / body: Uint8Array — see src/client.ts), a
- * fake Graph world router, and fakes for Session / AuthChannel / Query. No
- * network, no timers (client sleep/random are injected as instant/zero by
- * the tests).
+ * Shared offline test harness. The GENERIC plumbing — host-shaped JSON
+ * responses, the exact-URL scripted fetch, the instant clock, and the fakes
+ * for Session / AuthChannel — comes from `@kiagent/connector-sdk/testing`;
+ * what stays here is the part no other connector can use: the fake Microsoft
+ * Graph world (delta feeds, picker listings, pre-signed downloads), the
+ * driveItem fixture builders, and the Query fake the ingest hash-skip needs.
+ *
+ * `jsonRes` / `instantClock` / the `HostResponse` type are re-exported so the
+ * suites keep importing every fixture helper from this one module.
  *
  * Lives outside src/__tests__ so jest's default testMatch does not treat it
- * as a suite. Never bundled: build.mjs only follows imports from index.ts.
+ * as a suite. Never bundled: build.mjs only follows imports from index.ts, so
+ * the SDK's testing entrypoint (which pulls in node:child_process) is
+ * reachable only from the suites.
  */
 import type {
-  Account,
   AuthChannel,
   Credentials,
   Document,
@@ -19,26 +24,19 @@ import type {
   Query,
   Session,
 } from '@kiagent/connector-sdk';
+import type { HostResponse } from '@kiagent/connector-sdk/http';
+import {
+  fakeAuthChannel,
+  fakeSession,
+  instantClock,
+  jsonRes,
+  scriptedFetch,
+} from '@kiagent/connector-sdk/testing';
 import { GRAPH_BASE, type NetFetch } from '../client';
 import type { DriveItem } from '../source';
 
-export interface HostResponse {
-  status: number;
-  statusText: string;
-  headers: Record<string, string>;
-  body: Uint8Array;
-}
-
-export const jsonRes = (
-  status: number,
-  body: unknown,
-  headers: Record<string, string> = {},
-): HostResponse => ({
-  status,
-  statusText: '',
-  headers,
-  body: new TextEncoder().encode(JSON.stringify(body)),
-});
+export { instantClock, jsonRes };
+export type { HostResponse };
 
 export const bytesRes = (status: number, body: Uint8Array): HostResponse => ({
   status,
@@ -117,58 +115,66 @@ function paginate(url: URL, raw: GraphChildItemFx[] | GraphChildItemFx[][]): Hos
   return jsonRes(200, body);
 }
 
+/** The SDK kit's `scriptedFetch` with Graph's routing layered on top: the
+ *  exact-URL fixtures (`deltaPages` / `downloads`) ARE the kit's own `urls`
+ *  table, and the kit's `custom` hook carries the world's own hook plus the
+ *  `/me`, `sharedWithMe`, `children` and item-GET endpoints — the domain
+ *  knowledge that deliberately stays out of the shared kit. A URL matched by
+ *  neither throws (the kit's `unhandled url`), which is what keeps a missing
+ *  fixture from silently passing as an empty listing.
+ *
+ *  The two layers cannot collide: every path route above is a `graph.
+ *  microsoft.com` path WITHOUT a `/delta` segment, while `deltaPages` keys
+ *  all carry one and `downloads` keys live on another host. */
 export function graphFetch(world: GraphWorld = {}): { fetchFn: NetFetch; calls: string[] } {
-  const calls: string[] = [];
-  const counts = new Map<string, number>();
-  const fetchFn: NetFetch = async (rawUrl) => {
-    const urlStr = String(rawUrl);
-    calls.push(urlStr);
-    const count = counts.get(urlStr) ?? 0;
-    counts.set(urlStr, count + 1);
-    const url = new URL(urlStr);
-
-    if (world.custom) {
-      const r = world.custom(url, count);
-      if (r) return r;
-    }
-
-    if (world.deltaPages && Object.prototype.hasOwnProperty.call(world.deltaPages, urlStr)) {
-      const fx = world.deltaPages[urlStr];
-      return isHostResponse(fx) ? fx : jsonRes(200, fx);
-    }
-    if (world.downloads && Object.prototype.hasOwnProperty.call(world.downloads, urlStr)) {
-      const fx = world.downloads[urlStr];
-      return isHostResponse(fx) ? fx : bytesRes(200, fx);
-    }
-
-    const p = url.pathname;
-    if (p === '/v1.0/me') {
-      return jsonRes(200, world.about ?? { mail: 'user@example.com' });
-    }
-    if (p === '/v1.0/me/drive/sharedWithMe') {
-      return paginate(url, world.sharedRoots ?? []);
-    }
-    const childrenM = /^\/v1\.0\/me\/drive\/items\/([^/]+)\/children$/.exec(p);
-    if (childrenM) {
-      const id = childrenM[1];
-      const raw = world.children?.[id];
-      if (raw === undefined) throw new Error(`fake graph: no children listing for ${id}`);
-      return paginate(url, raw);
-    }
-    const itemM = /^\/v1\.0\/me\/drive\/items\/([^/]+)$/.exec(p);
-    if (itemM) {
-      const id = itemM[1];
-      const v = world.items?.[id];
-      if (v === undefined) throw new Error(`fake graph: no item GET for ${id}`);
-      return isHostResponse(v) ? v : jsonRes(200, v);
-    }
-    throw new Error(`fake graph: unhandled url ${urlStr}`);
+  const urls: Record<string, HostResponse | unknown> = {
+    // Plain pages are JSON-wrapped by the kit; a HostResponse fixture (a 401
+    // page, say) is passed through by it untouched — same as before.
+    ...world.deltaPages,
+    ...Object.fromEntries(
+      Object.entries(world.downloads ?? {}).map(([url, fx]) => [
+        url,
+        // Raw bytes must be wrapped HERE: the kit JSON-encodes any plain
+        // value, which would turn a Uint8Array body into `{"0":1,…}`.
+        fx instanceof Uint8Array ? bytesRes(200, fx) : fx,
+      ]),
+    ),
   };
+
+  const { fetchFn, calls } = scriptedFetch({
+    urls,
+    custom: (url, count) => {
+      if (world.custom) {
+        const r = world.custom(url, count);
+        if (r) return r;
+      }
+
+      const p = url.pathname;
+      if (p === '/v1.0/me') {
+        return jsonRes(200, world.about ?? { mail: 'user@example.com' });
+      }
+      if (p === '/v1.0/me/drive/sharedWithMe') {
+        return paginate(url, world.sharedRoots ?? []);
+      }
+      const childrenM = /^\/v1\.0\/me\/drive\/items\/([^/]+)\/children$/.exec(p);
+      if (childrenM) {
+        const id = childrenM[1];
+        const raw = world.children?.[id];
+        if (raw === undefined) throw new Error(`fake graph: no children listing for ${id}`);
+        return paginate(url, raw);
+      }
+      const itemM = /^\/v1\.0\/me\/drive\/items\/([^/]+)$/.exec(p);
+      if (itemM) {
+        const id = itemM[1];
+        const v = world.items?.[id];
+        if (v === undefined) throw new Error(`fake graph: no item GET for ${id}`);
+        return isHostResponse(v) ? v : jsonRes(200, v);
+      }
+      return undefined; // → the exact-URL tables above
+    },
+  });
   return { fetchFn, calls };
 }
-
-/** Instant clock + zero jitter for the source/client test seam. */
-export const instantClock = { sleep: async () => {}, random: () => 0 };
 
 export function fakeQuery(docs: Document[] = []): Query & {
   byExternalIdCalls: Array<{ account: string; externalId: string; type: string }>;
@@ -212,7 +218,7 @@ export function makeSession(
   } = {},
 ): { session: Session; logs: { level: string; msg: string }[] } {
   const logs: { level: string; msg: string }[] = [];
-  const session: Session = {
+  const base = fakeSession({
     account: {
       id: 'acc-1',
       source: 'onedrive',
@@ -221,13 +227,23 @@ export function makeSession(
       status: 'live',
       cursor: null,
       createdAt: '2026-01-01T00:00:00Z',
-    } as Account,
-    signal: opts.signal ?? new AbortController().signal,
-    credentials: async () =>
-      opts.creds === undefined ? { accessToken: 'ms-test-token-deadbeef' } : opts.creds,
-    log: (level, msg) => logs.push({ level, msg }),
+    },
+    // undefined = the default live token; an explicit null is the
+    // no-credentials case the auth-error suites need.
+    credentials: opts.creds === undefined ? { accessToken: 'ms-test-token-deadbeef' } : opts.creds,
+    signal: opts.signal,
+  });
+  return {
+    // Only `log` is re-pointed off the kit's session: it collects
+    // [level, msg] tuples, and these suites assert on {level, msg}.
+    session: {
+      account: base.account,
+      signal: base.signal,
+      credentials: base.credentials,
+      log: (level, msg) => logs.push({ level, msg }),
+    },
+    logs,
   };
-  return { session, logs };
 }
 
 export function makeAuth(
@@ -246,16 +262,17 @@ export function makeAuth(
   getSchema: () => unknown;
   getPickerSpec: () => FolderPickerSpec | undefined;
 } {
-  const statuses: string[] = [];
   let scopes: string[] | undefined;
   let schema: unknown;
   let pickerSpec: FolderPickerSpec | undefined;
-  const auth: AuthChannel = {
+  // Every interactive verb is scripted: connect() always reaches for oauth
+  // and the picker, so the kit's reject-if-unscripted default would only ever
+  // fire on a genuinely unexpected call.
+  const auth = fakeAuthChannel({
     oauth: async (s) => {
       scopes = s;
       return opts.creds ?? { accessToken: 'ms-test-token-deadbeef' };
     },
-    showQr: () => {},
     prompt: async (s) => {
       schema = s;
       return opts.answers ?? {};
@@ -265,11 +282,10 @@ export function makeAuth(
       if (typeof opts.picked === 'function') return opts.picked(spec);
       return opts.picked ?? [{ id: 'root', name: 'OneDrive', hasChildren: true }];
     },
-    status: (m) => statuses.push(m),
-  };
+  });
   return {
     auth,
-    statuses,
+    statuses: auth.statuses,
     getScopes: () => scopes,
     getSchema: () => schema,
     getPickerSpec: () => pickerSpec,
