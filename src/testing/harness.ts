@@ -93,7 +93,7 @@ export interface GraphWorld {
    *  URL of each root/token combination, and chain continuation pages by
    *  setting `@odata.nextLink`/`@odata.deltaLink` to further keys of this
    *  same map (mirrors how Graph's own opaque nextLink/deltaLink URLs work —
-   *  and how the legacy alpha-cent connector tests mocked `graphFetch`). */
+   *  and how the legacy v1 connector tests mocked `graphFetch`). */
   deltaPages?: Record<string, GraphDeltaPageFx | HostResponse>;
   /** Pre-signed downloadUrl → raw bytes (no bearer auth, no Graph host). */
   downloads?: Record<string, Uint8Array | HostResponse>;

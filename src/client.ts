@@ -1,5 +1,5 @@
 /**
- * v2 Microsoft Graph client — ported from alpha-cent's shared bearer-fetch
+ * v2 Microsoft Graph client — ported from the v1 repo's shared bearer-fetch
  * core (`git show main:src/main/connectors/http-shared/bearer-fetch.ts`) as
  * pinned by `ms-shared/graph-fetch.ts`'s `graphFetch` wrapper.
  *
