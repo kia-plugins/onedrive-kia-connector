@@ -59,7 +59,8 @@ describe('toDocument', () => {
       rootFolderId: 'FA',
     };
 
-    const d = source.toDocument(item) as { binary?: unknown; markdown: string | null };
+    const d = source.toDocument(item) as { type: string; binary?: unknown; markdown: string | null };
+    expect(d.type).toBe('file');
     expect(d.markdown).toBe('');
     expect(d.binary).toBeUndefined();
   });
@@ -74,8 +75,23 @@ describe('toDocument', () => {
       displayPath: 'Alpha / a.pdf',
       rootFolderId: 'FA',
     };
-    const d = source.toDocument(item) as { url?: string };
+    const d = source.toDocument(item) as { type: string; url?: string };
+    expect(d.type).toBe('file');
     expect(d.url).toBe('https://onedrive.live.com/');
+  });
+
+  it('always stamps the exact "file" type literal — a typo here would silently break deletion-identity matching (byExternalId(id, "file")) against the doc produced here', () => {
+    const { source } = makeSource();
+    const item: OneDriveItem = {
+      file: driveFile('f9', 'notes.txt', { file: { mimeType: 'text/plain' } }),
+      markdown: 'hello',
+      extractionStatus: 'ok',
+      displayPath: 'Alpha / notes.txt',
+      rootFolderId: 'FA',
+    };
+
+    const d = source.toDocument(item) as DocumentInput;
+    expect(d.type).toBe('file');
   });
 });
 
