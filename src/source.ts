@@ -39,7 +39,7 @@
  *    it because its own folder-picker UI let a user select a folder inside
  *    an already-tracked one. The v2 contract's shared `pickFolders` already
  *    guarantees "covering roots — never both a node and its own descendant"
- *    (see kiagent-contracts.ts's `AuthChannel.pickFolders` doc), so there is
+ *    (see `AuthChannel.pickFolders` in @kiagent/connector-sdk), so there is
  *    no place left in this connector for overlap.ts's check to run. As
  *    defense in depth against a hand-edited config with overlapping roots
  *    anyway (or a future picker relaxation), `processed` (a per-pull-call
@@ -77,7 +77,7 @@ import type {
   Query,
   Session,
   Source,
-} from './kiagent-contracts';
+} from '@kiagent/connector-sdk';
 import {
   GRAPH_BASE,
   GraphApiError,

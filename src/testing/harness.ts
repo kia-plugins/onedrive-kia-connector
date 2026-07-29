@@ -18,7 +18,7 @@ import type {
   HostFor,
   Query,
   Session,
-} from '../kiagent-contracts';
+} from '@kiagent/connector-sdk';
 import { GRAPH_BASE, type NetFetch } from '../client';
 import type { DriveItem } from '../source';
 

@@ -5,7 +5,7 @@
  */
 import { execSync } from 'node:child_process';
 import { join } from 'node:path';
-import type { HostFor, Query } from '../kiagent-contracts';
+import type { HostFor, Query } from '@kiagent/connector-sdk';
 
 describe('dist bundle loads standalone', () => {
   it('require()s dist/index.js and activate() returns the onedrive source', async () => {

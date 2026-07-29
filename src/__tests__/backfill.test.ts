@@ -7,7 +7,7 @@
  */
 import { createOneDriveSource, GRAPH_BASE, type OneDriveCursor, type OneDriveItem } from '../source';
 import { OneDriveAuthError } from '../client';
-import type { Batch } from '../kiagent-contracts';
+import type { Batch } from '@kiagent/connector-sdk';
 import {
   collect,
   deltaUrl,

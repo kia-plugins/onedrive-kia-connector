@@ -6,7 +6,7 @@
  * omit the annotation), and the one-shot 403-refresh-and-retry.
  */
 import { createOneDriveSource, GRAPH_BASE, MAX_BINARY_BYTES, type OneDriveItem } from '../source';
-import type { Batch } from '../kiagent-contracts';
+import type { Batch } from '@kiagent/connector-sdk';
 import {
   collect,
   deltaUrl,

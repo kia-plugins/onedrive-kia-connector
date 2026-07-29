@@ -19,7 +19,7 @@
  * Drive's 'root'. Functionally identical to v1; only 'sharedWithMe' keeps its
  * own endpoint (Graph has no item-id alias for it).
  */
-import type { FolderCount, FolderNode } from './kiagent-contracts';
+import type { FolderCount, FolderNode } from '@kiagent/connector-sdk';
 import { GRAPH_BASE, type GraphClient } from './client';
 
 /** Picker listing page size (v1's `$top=200`). */

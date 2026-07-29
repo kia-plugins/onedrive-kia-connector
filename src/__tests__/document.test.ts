@@ -3,7 +3,7 @@
  */
 import { createOneDriveSource, type OneDriveItem } from '../source';
 import { GraphApiError } from '../client';
-import type { DocumentInput } from '../kiagent-contracts';
+import type { DocumentInput } from '@kiagent/connector-sdk';
 import { driveFile, fakeDoc, graphFetch, instantClock, jsonRes, makeHost, makeSession } from '../testing/harness';
 
 function makeSource(world: Parameters<typeof graphFetch>[0] = {}) {

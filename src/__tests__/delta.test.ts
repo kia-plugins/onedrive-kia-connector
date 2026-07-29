@@ -4,7 +4,7 @@
  * pages, and the 410 resyncRequired re-prime.
  */
 import { createOneDriveSource, GRAPH_BASE, type OneDriveCursor, type OneDriveItem } from '../source';
-import type { Batch } from '../kiagent-contracts';
+import type { Batch } from '@kiagent/connector-sdk';
 import {
   collect,
   deletedItem,
