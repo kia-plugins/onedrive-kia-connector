@@ -1,7 +1,7 @@
 {
   "id": "kia.onedrive",
   "name": "OneDrive",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "engine": ">=1.2.0 <3.0.0",
   "entry": "dist/index.js",
   "caps": [
