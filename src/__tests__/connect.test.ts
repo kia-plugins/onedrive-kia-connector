@@ -5,7 +5,14 @@
  * and cancel propagation.
  */
 import { createOneDriveSource, FILES_SCOPES } from '../source';
-import { graphFetch, instantClock, makeAuth, makeHost } from '../testing/harness';
+import {
+  fakeAccount,
+  fakeQuery,
+  graphFetch,
+  instantClock,
+  makeAuth,
+  makeHost,
+} from '../testing/harness';
 
 describe('connect', () => {
   it('oauth happy path: scope, statuses, identifier = mail, picked folders → roots config', async () => {
@@ -132,5 +139,90 @@ describe('connect', () => {
     const source = createOneDriveSource(makeHost(fetchFn), instantClock);
     const { auth } = makeAuth();
     await expect(source.connect(auth)).rejects.toThrow(/missing mail and userPrincipalName/);
+  });
+});
+
+describe('reconnect after auth failure keeps the stored selection', () => {
+  const about = { mail: 'ed@example.com' };
+
+  it('skips the picker and returns the prior config verbatim', async () => {
+    const { fetchFn, calls } = graphFetch({ about });
+    const prior = fakeAccount({
+      config: { roots: [{ rootFolderId: 'OLD1', rootName: 'Kept' }] },
+    });
+    const source = createOneDriveSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
+    const { auth, statuses, getPickerSpec } = makeAuth();
+
+    const res = await source.connect(auth);
+
+    expect(res).toEqual({ identifier: 'ed@example.com', config: prior.config });
+    expect(getPickerSpec()).toBeUndefined();
+    expect(statuses).toEqual([
+      'Waiting for Microsoft sign-in…',
+      'Fetching Microsoft profile…',
+      'Restoring previous folder selection…',
+    ]);
+    // Only the /me call — no folder lookups on the restore path.
+    expect(calls).toHaveLength(1);
+  });
+
+  it('restores when the identifier came from the userPrincipalName fallback', async () => {
+    const { fetchFn } = graphFetch({ about: { userPrincipalName: 'ed@tenant.onmicrosoft.com' } });
+    const prior = fakeAccount({
+      identifier: 'ed@tenant.onmicrosoft.com',
+      config: { roots: [{ rootFolderId: 'OLD1', rootName: 'Kept' }] },
+    });
+    const source = createOneDriveSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
+    const { auth, getPickerSpec } = makeAuth();
+
+    const res = await source.connect(auth);
+
+    expect(res).toEqual({ identifier: 'ed@tenant.onmicrosoft.com', config: prior.config });
+    expect(getPickerSpec()).toBeUndefined();
+  });
+
+  it('a healthy account with the same identifier still runs the picker', async () => {
+    const { fetchFn } = graphFetch({ about });
+    const prior = fakeAccount({
+      status: 'live',
+      config: { roots: [{ rootFolderId: 'OLD1', rootName: 'Kept' }] },
+    });
+    const source = createOneDriveSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
+    const { auth, getPickerSpec } = makeAuth({
+      picked: [{ id: 'NEW1', name: 'New', hasChildren: true }],
+    });
+
+    const res = await source.connect(auth);
+
+    expect(getPickerSpec()).toBeDefined();
+    expect(res.config).toEqual({ roots: [{ rootFolderId: 'NEW1', rootName: 'New' }] });
+  });
+
+  it('a needsReauth account under a different identity does not hijack the flow', async () => {
+    const { fetchFn } = graphFetch({ about });
+    const prior = fakeAccount({ identifier: 'other@example.com' });
+    const source = createOneDriveSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
+    const { auth, getPickerSpec } = makeAuth({
+      picked: [{ id: 'NEW1', name: 'New', hasChildren: true }],
+    });
+
+    const res = await source.connect(auth);
+
+    expect(getPickerSpec()).toBeDefined();
+    expect(res.identifier).toBe('ed@example.com');
+    expect(res.config).toEqual({ roots: [{ rootFolderId: 'NEW1', rootName: 'New' }] });
+  });
+
+  it("another source's needsReauth account with the same identifier is ignored", async () => {
+    const { fetchFn } = graphFetch({ about });
+    const prior = fakeAccount({ source: 'ms365' });
+    const source = createOneDriveSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
+    const { auth, getPickerSpec } = makeAuth({
+      picked: [{ id: 'NEW1', name: 'New', hasChildren: true }],
+    });
+
+    await source.connect(auth);
+
+    expect(getPickerSpec()).toBeDefined();
   });
 });
