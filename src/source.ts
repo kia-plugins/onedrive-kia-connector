@@ -100,6 +100,25 @@ export const FILES_SCOPES = ['Files.Read.All', 'User.Read'];
 /** v1 had NO cap (whole file into a Buffer) — v2 binds one (see module doc). */
 export const MAX_BINARY_BYTES = 25 * 1024 * 1024;
 
+/**
+ * Per-batch flush budget. A Graph delta page is server-sized (typically a
+ * few hundred items) and every convertible file in it — images included, for
+ * vision OCR — carries up to MAX_BINARY_BYTES of downloaded bytes. Holding a
+ * whole page's bytes at once (then structured-cloning them over IPC in ONE
+ * message) put a photo-heavy personal OneDrive past the extension process's
+ * heap, and because the cursor only advances per page the same page replayed
+ * on every retry: a deterministic crash loop ("extension process exited").
+ * So a page is flushed to the engine in sub-page chunks once the accumulated
+ * bytes or entry count cross these budgets — see `pageChunks`.
+ */
+export const BATCH_BYTE_BUDGET = 32 * 1024 * 1024;
+export const BATCH_ITEM_LIMIT = 100;
+
+export interface BatchBudget {
+  bytes: number;
+  items: number;
+}
+
 export interface RootConfig {
   rootFolderId: string;
   rootName: string;
@@ -194,6 +213,7 @@ interface ItemDeps {
   /** Item ids already emitted THIS pull() call — guards overlapping
    *  configured roots (see module doc). */
   processed: Set<string>;
+  budget: BatchBudget;
 }
 
 /** Query-first content-hash skip: an unchanged, still-live document is never
@@ -302,40 +322,74 @@ async function buildItem(raw: DriveItem, root: RootConfig, deps: ItemDeps): Prom
   };
 }
 
-/** Build the items/deletions for one Graph delta page. Folders (no `.file`
- *  facet) and the root item itself are never ingested (v1 parity). */
-async function buildBatchItems(
+interface PageChunk {
+  items: OneDriveItem[];
+  deletions: ExternalRef[];
+  /** True on the LAST chunk of the page — the only one after which the
+   *  caller may advance its cursor past this page. Intermediate chunks must
+   *  be committed under the cursor that fetched the page, so a crash after
+   *  them replays the page (idempotent via hash-skip) rather than skipping
+   *  its unflushed remainder. */
+  pageComplete: boolean;
+}
+
+/**
+ * Build the items/deletions for one Graph delta page, yielding them in
+ * sub-page chunks as soon as the accumulated downloaded bytes or entry count
+ * cross `deps.budget` (see BATCH_BYTE_BUDGET). Always ends with exactly one
+ * `pageComplete` chunk (possibly empty) unless the session is aborted.
+ * Folders (no `.file` facet) and the root item itself are never ingested
+ * (v1 parity). Deletions are cheap but count against the entry limit so a
+ * mass-delete page is still bounded.
+ */
+async function* pageChunks(
   page: GraphDeltaPage,
   root: RootConfig,
   deps: ItemDeps,
   opts: { includeDeletions: boolean },
-): Promise<{ items: OneDriveItem[]; deletions: ExternalRef[] }> {
-  const items: OneDriveItem[] = [];
-  const deletions: ExternalRef[] = [];
+): AsyncGenerator<PageChunk> {
+  let items: OneDriveItem[] = [];
+  let deletions: ExternalRef[] = [];
+  let bytes = 0;
+  const full = (): boolean => bytes >= deps.budget.bytes || items.length + deletions.length >= deps.budget.items;
+  const flush = (pageComplete: boolean): PageChunk => {
+    const chunk = { items, deletions, pageComplete };
+    items = [];
+    deletions = [];
+    bytes = 0;
+    return chunk;
+  };
+
   for (const raw of page.value ?? []) {
-    if (deps.session.signal.aborted) break;
+    if (deps.session.signal.aborted) return;
     if (raw.deleted) {
       if (opts.includeDeletions) {
         const existing = await deps.query.byExternalId(deps.session.account.id, raw.id, 'file');
         if (existing) deletions.push({ externalId: raw.id, type: 'file' });
       }
+    } else if (!raw.file || raw.id === root.rootFolderId || deps.processed.has(raw.id)) {
+      // folder (not ingested, v1 parity) / the root item itself / overlapping
+      // tracked roots — first root wins.
       continue;
+    } else {
+      deps.processed.add(raw.id);
+      try {
+        const item = await buildItem(raw, root, deps);
+        if (item) {
+          items.push(item);
+          bytes += item.bytes?.byteLength ?? 0;
+        }
+      } catch (e) {
+        if (isAuthError(e)) throw e;
+        // One unreadable item must not abort the walk (v1 parity: backfill.ts
+        // / delta.ts both log-and-continue on a per-item error).
+        deps.session.log('warn', `onedrive: item ${raw.id} skipped: ${errText(e)}`);
+      }
     }
-    if (!raw.file) continue; // folder — not ingested (v1 parity)
-    if (raw.id === root.rootFolderId) continue; // the root item itself
-    if (deps.processed.has(raw.id)) continue; // overlapping tracked roots — first root wins
-    deps.processed.add(raw.id);
-    try {
-      const item = await buildItem(raw, root, deps);
-      if (item) items.push(item);
-    } catch (e) {
-      if (isAuthError(e)) throw e;
-      // One unreadable item must not abort the walk (v1 parity: backfill.ts
-      // / delta.ts both log-and-continue on a per-item error).
-      deps.session.log('warn', `onedrive: item ${raw.id} skipped: ${errText(e)}`);
-    }
+    if (full()) yield flush(false);
   }
-  return { items, deletions };
+  if (deps.session.signal.aborted) return;
+  yield flush(true);
 }
 
 const tokenFromDeltaLink = (link: string): string => new URL(link).searchParams.get('token') ?? '';
@@ -351,9 +405,13 @@ function isResyncRequired(msg: string): boolean {
 interface WalkStep {
   items: OneDriveItem[];
   deletions: ExternalRef[];
+  /** False for an intermediate chunk of a page (budget flush) — commit under
+   *  the cursor that fetched the page; neither `token` nor `nextLink` is set. */
+  pageComplete: boolean;
   /** Set once the walk reaches `@odata.deltaLink` — the new live token. */
   token?: string;
-  /** Set for every non-final page — `@odata.nextLink` to resume from. */
+  /** Set on the final chunk of every non-final page — `@odata.nextLink` to
+   *  resume from. */
   nextLink?: string;
 }
 
@@ -363,7 +421,9 @@ interface WalkStep {
  * one step per page. The SAME mechanism serves both a root's initial
  * establishment (backfill) and a resync reprime (delta) — v1 shared the
  * identical `walkGraphDelta` call for both (`backfill.ts`'s `enumerateRoot` /
- * `delta.ts`'s `walkRootDelta` without a token).
+ * `delta.ts`'s `walkRootDelta` without a token). A page over the batch
+ * budget yields several steps; only its last one (`pageComplete`) carries
+ * the link/token to advance by.
  */
 async function* walkRootToDeltaLink(
   client: GraphClient,
@@ -376,20 +436,24 @@ async function* walkRootToDeltaLink(
   for (;;) {
     if (deps.session.signal.aborted) return;
     const page = await client.request<GraphDeltaPage>(url);
-    const { items, deletions } = await buildBatchItems(page, root, deps, { includeDeletions });
-    if (page['@odata.deltaLink']) {
-      yield { items, deletions, token: tokenFromDeltaLink(page['@odata.deltaLink']) };
-      return;
-    }
-    if (!page['@odata.nextLink']) {
+    if (!page['@odata.deltaLink'] && !page['@odata.nextLink']) {
       // v1 parity (backfill.ts): a delta feed that ends without either link
       // is a genuine upstream contract violation, not a recoverable case.
       throw new Error(
         `onedrive: root ${root.rootFolderId} delta feed ended without a nextLink or deltaLink`,
       );
     }
-    yield { items, deletions, nextLink: page['@odata.nextLink'] };
-    url = page['@odata.nextLink'];
+    for await (const chunk of pageChunks(page, root, deps, { includeDeletions })) {
+      if (!chunk.pageComplete) {
+        yield { ...chunk };
+      } else if (page['@odata.deltaLink']) {
+        yield { ...chunk, token: tokenFromDeltaLink(page['@odata.deltaLink']) };
+      } else {
+        yield { ...chunk, nextLink: page['@odata.nextLink'] };
+      }
+    }
+    if (page['@odata.deltaLink']) return;
+    url = page['@odata.nextLink']!;
   }
 }
 
@@ -415,8 +479,9 @@ async function* backfill(
   cursor: OneDriveCursor | null,
   roots: RootConfig[],
   processed: Set<string>,
+  budget: BatchBudget,
 ): AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>> {
-  const deps: ItemDeps = { client, session, query, fetchFn, processed };
+  const deps: ItemDeps = { client, session, query, fetchFn, processed, budget };
   if (roots.length === 0) {
     yield { phase: 'live', items: [], cursor: { delta_tokens: cursor?.delta_tokens ?? {} } };
     return;
@@ -438,14 +503,22 @@ async function* backfill(
     const root = roots[i];
     if (deltaTokens[root.rootFolderId] != null) continue; // already established
 
-    const startUrl =
-      i === startIdx && resumeNextLink
-        ? resumeNextLink
-        : `${GRAPH_BASE}/me/drive/items/${root.rootFolderId}/delta`;
+    const resuming = i === startIdx && resumeNextLink;
+    const startUrl = resuming
+      ? resumeNextLink!
+      : `${GRAPH_BASE}/me/drive/items/${root.rootFolderId}/delta`;
+    // The cursor that fetched the CURRENT page — what an intermediate
+    // (budget-flushed) chunk commits under, so a crash replays this page.
+    let pageCursor: OneDriveCursor = {
+      delta_tokens: { ...deltaTokens },
+      backfill: resuming ? { root_index: i, next_link: resumeNextLink } : { root_index: i },
+    };
 
     for await (const step of walkRootToDeltaLink(client, root, deps, startUrl, false)) {
       if (session.signal.aborted) return;
-      if (step.token != null) {
+      if (!step.pageComplete) {
+        yield { phase: 'backfill', items: step.items, cursor: pageCursor };
+      } else if (step.token != null) {
         deltaTokens[root.rootFolderId] = step.token;
         const more = i + 1 < roots.length;
         const nextCursor: OneDriveCursor = more
@@ -453,14 +526,11 @@ async function* backfill(
           : { delta_tokens: { ...deltaTokens } };
         yield { phase: more ? 'backfill' : 'live', items: step.items, cursor: nextCursor };
       } else {
-        yield {
-          phase: 'backfill',
-          items: step.items,
-          cursor: {
-            delta_tokens: { ...deltaTokens },
-            backfill: { root_index: i, next_link: step.nextLink },
-          },
+        pageCursor = {
+          delta_tokens: { ...deltaTokens },
+          backfill: { root_index: i, next_link: step.nextLink },
         };
+        yield { phase: 'backfill', items: step.items, cursor: pageCursor };
       }
     }
   }
@@ -497,19 +567,23 @@ async function* pollRoot(
   for (;;) {
     if (deps.session.signal.aborted) return;
     const page = await client.request<GraphDeltaPage>(url);
-    const { items, deletions } = await buildBatchItems(page, root, deps, { includeDeletions: true });
-    if (page['@odata.deltaLink']) {
-      deltaTokens[root.rootFolderId] = tokenFromDeltaLink(page['@odata.deltaLink']);
-      yield { phase: 'live', items, deletions, cursor: { delta_tokens: { ...deltaTokens } } };
-      return;
+    // Intermediate pages (and intermediate chunks of any page) commit under
+    // the PRIOR token — the new one is only stored once the deltaLink page's
+    // final chunk is out. A feed that ends without a link keeps the prior
+    // token (v1 `walkRootDelta` parity: `return token ?? ''`) but still
+    // surfaces its items.
+    for await (const chunk of pageChunks(page, root, deps, { includeDeletions: true })) {
+      if (chunk.pageComplete && page['@odata.deltaLink']) {
+        deltaTokens[root.rootFolderId] = tokenFromDeltaLink(page['@odata.deltaLink']);
+      }
+      yield {
+        phase: 'live',
+        items: chunk.items,
+        deletions: chunk.deletions,
+        cursor: { delta_tokens: { ...deltaTokens } },
+      };
     }
-    if (!page['@odata.nextLink']) {
-      // Feed ended without a link — keep the prior token (v1 `walkRootDelta`
-      // parity: `return token ?? ''`); still surface this page's items.
-      yield { phase: 'live', items, deletions, cursor: { delta_tokens: { ...deltaTokens } } };
-      return;
-    }
-    yield { phase: 'live', items, deletions, cursor: { delta_tokens: { ...deltaTokens } } };
+    if (page['@odata.deltaLink'] || !page['@odata.nextLink']) return;
     url = page['@odata.nextLink'];
   }
 }
@@ -528,8 +602,9 @@ async function* delta(
   cursor: OneDriveCursor,
   roots: RootConfig[],
   processed: Set<string>,
+  budget: BatchBudget,
 ): AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>> {
-  const deps: ItemDeps = { client, session, query, fetchFn, processed };
+  const deps: ItemDeps = { client, session, query, fetchFn, processed, budget };
   const deltaTokens: Record<string, string> = { ...cursor.delta_tokens };
 
   for (const root of roots) {
@@ -555,12 +630,23 @@ async function* delta(
   }
 }
 
+export interface OneDriveTestSeams extends Partial<Pick<GraphClientDeps, 'sleep' | 'random'>> {
+  batchByteBudget?: number;
+  batchItemLimit?: number;
+}
+
 export function createOneDriveSource(
   host: HostFor<'net' | 'query'>,
   // Test seam only: GraphClient's sleep/random are injectable so retry tests
-  // never actually wait; production callers omit this.
-  clock?: Pick<GraphClientDeps, 'sleep' | 'random'>,
+  // never actually wait, and the batch budgets shrink so chunking is
+  // testable with tiny fixtures; production callers omit this.
+  seams?: OneDriveTestSeams,
 ): Source<OneDriveCursor, OneDriveItem> {
+  const { batchByteBudget, batchItemLimit, ...clock } = seams ?? {};
+  const budget: BatchBudget = {
+    bytes: batchByteBudget ?? BATCH_BYTE_BUDGET,
+    items: batchItemLimit ?? BATCH_ITEM_LIMIT,
+  };
   const clientFor = (session: Session): GraphClient =>
     new GraphClient({
       fetch: host.net.fetch,
@@ -640,9 +726,9 @@ export function createOneDriveSource(
       const roots = rootsConfig(session);
       const processed = new Set<string>();
       if (!backfillDone(cursor, roots)) {
-        yield* backfill(client, session, host.query, host.net.fetch, cursor, roots, processed);
+        yield* backfill(client, session, host.query, host.net.fetch, cursor, roots, processed, budget);
       } else {
-        yield* delta(client, session, host.query, host.net.fetch, cursor!, roots, processed);
+        yield* delta(client, session, host.query, host.net.fetch, cursor!, roots, processed, budget);
       }
     },
 
