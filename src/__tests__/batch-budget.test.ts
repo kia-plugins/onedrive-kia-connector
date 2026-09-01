@@ -142,6 +142,40 @@ describe('batch byte budget', () => {
     expect(batches.at(-1)!.cursor).toEqual({ delta_tokens: { FA: 'NEW' } });
   });
 
+  it('delta: a deletion reported by two overlapping roots is surfaced once per pull', async () => {
+    const urlA = deltaUrl('FA', 'TA');
+    const urlB = deltaUrl('FB', 'TB');
+    const { source } = makeSource(
+      {
+        deltaPages: {
+          [urlA]: {
+            value: [deletedItem('gone1')],
+            '@odata.deltaLink': `${GRAPH_BASE}/me/drive/items/FA/delta?token=TA2`,
+          },
+          [urlB]: {
+            value: [deletedItem('gone1')],
+            '@odata.deltaLink': `${GRAPH_BASE}/me/drive/items/FB/delta?token=TB2`,
+          },
+        },
+      },
+      {},
+      fakeQuery([fakeDoc('gone1', 'file', {})]),
+    );
+    const { session } = makeSession({
+      config: {
+        roots: [
+          { rootFolderId: 'FA', rootName: 'Alpha' },
+          { rootFolderId: 'FB', rootName: 'Beta' },
+        ],
+      },
+    });
+
+    const batches = (await collect(source.pull(session, { delta_tokens: { FA: 'TA', FB: 'TB' } }))) as B[];
+
+    expect(batches.flatMap((b) => (b.deletions ?? []).map((d) => d.externalId))).toEqual(['gone1']);
+    expect(batches.at(-1)!.cursor).toEqual({ delta_tokens: { FA: 'TA2', FB: 'TB2' } });
+  });
+
   it('backfill: intermediate chunks repeat the cursor that fetched the page; the final chunk stores the nextLink', async () => {
     const start = deltaUrl('FA');
     const page2 = `${GRAPH_BASE}/me/drive/items/FA/delta?$skiptoken=p2`;

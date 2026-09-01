@@ -109,10 +109,12 @@ export const MAX_BINARY_BYTES = 25 * 1024 * 1024;
  * heap, and because the cursor only advances per page the same page replayed
  * on every retry: a deterministic crash loop ("extension process exited").
  * So a page is flushed to the engine in sub-page chunks once the accumulated
- * bytes or entry count cross these budgets — see `pageChunks`.
+ * bytes or entry count cross these budgets — see `pageChunks`. Both are soft
+ * ceilings checked AFTER an entry is added, so a chunk can overshoot by one
+ * file (≤ MAX_BINARY_BYTES).
  */
 export const BATCH_BYTE_BUDGET = 32 * 1024 * 1024;
-export const BATCH_ITEM_LIMIT = 100;
+export const BATCH_ITEM_LIMIT = 250;
 
 export interface BatchBudget {
   bytes: number;
@@ -363,10 +365,12 @@ async function* pageChunks(
   for (const raw of page.value ?? []) {
     if (deps.session.signal.aborted) return;
     if (raw.deleted) {
-      if (opts.includeDeletions) {
-        const existing = await deps.query.byExternalId(deps.session.account.id, raw.id, 'file');
-        if (existing) deletions.push({ externalId: raw.id, type: 'file' });
-      }
+      // Same overlapping-roots guard as live items: a deletion reported by two
+      // feeds is surfaced once per pull.
+      if (!opts.includeDeletions || deps.processed.has(raw.id)) continue;
+      deps.processed.add(raw.id);
+      const existing = await deps.query.byExternalId(deps.session.account.id, raw.id, 'file');
+      if (existing) deletions.push({ externalId: raw.id, type: 'file' });
     } else if (!raw.file || raw.id === root.rootFolderId || deps.processed.has(raw.id)) {
       // folder (not ingested, v1 parity) / the root item itself / overlapping
       // tracked roots — first root wins.
