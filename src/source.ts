@@ -39,7 +39,10 @@
  *    `MAX_CLOUD_BINARY_BYTES` = 25 MiB, images over `MAX_CLOUD_IMAGE_BYTES` =
  *    20 MiB) are ignored outright — no metadata-only row is produced for
  *    them, and an already-indexed file the policy now excludes is archived
- *    (see the ignore branch of `pageChunks`). v1 had no size cap at all (a
+ *    (see the ignore branch of `pageChunks`, and `buildItem`'s post-download
+ *    re-check for the declared-size-absent case — this connector has no
+ *    reconcile pass, so these two sites are the only places that will ever
+ *    clean up such a row). v1 had no size cap at all (a
  *    gap the google-docs-kia-connector template called out and fixed for
  *    Drive first). A file whose declared `size` is absent is admitted
  *    provisionally and re-checked against the same policy once its real
@@ -275,14 +278,24 @@ interface ItemDeps {
  *  re-downloaded (v1 ingest.ts's `canShortcut`, minus the metadata-only
  *  `last_seen_at` refresh — the v2 engine owns row freshness). An ARCHIVED
  *  match does NOT skip: re-emitting is what un-archives a doc that moved back
- *  into scope. A 'failed' row is never pinned behind an unchanged eTag —
- *  v1's exact rationale (possibly just a quota storm; must retry). */
+ *  into scope. Only an `'ok'` row (real, already-fetched content) is ever
+ *  pinned behind an unchanged eTag. Anything else bypasses the pin: a
+ *  'failed' row (v1's exact rationale — possibly just a quota storm; must
+ *  retry) AND, just as importantly, a row carrying one of the PRE-migration
+ *  statuses this connector used to write for an ineligible file
+ *  (`'unsupported'`/`'too-large'`) — `pageChunks` only ever calls `hashSkip`
+ *  for an item the CURRENT policy has judged eligible, so reaching here at
+ *  all means a legacy row that used to be ineligible was just newly rescued
+ *  by a policy change (e.g. an octet-stream-mime `.pdf` rescued by its
+ *  extension). Pinning it on an unchanged eTag would strand it as
+ *  contentless metadata forever, since nothing else in this connector will
+ *  ever revisit it. */
 async function hashSkip(deps: ItemDeps, itemId: string, etag: string | undefined): Promise<boolean> {
   if (!etag) return false;
   const existing = await deps.query.byExternalId(deps.session.account.id, itemId, 'file');
   if (!existing || existing.archivedAt) return false;
   const meta = existing.metadata as Record<string, unknown>;
-  if (meta.extraction_status === 'failed') return false;
+  if (meta.extraction_status !== 'ok') return false;
   return meta.etag === etag;
 }
 
@@ -326,8 +339,21 @@ async function downloadBytes(
  * its real byte length is known. May do I/O (downloadUrl refresh / bytes
  * download) — toDocument stays pure. Never called for a route `chooseRoute`
  * ruled OUT (see `pageChunks`'s ignore branch).
+ *
+ * `deletions` is the caller's (`pageChunks`'s) in-progress chunk array,
+ * passed through so the post-download re-check below can push into it
+ * directly — the exact same "was this id already a live row?" pattern
+ * `pageChunks`'s own pre-check ignore branch uses. This connector has no
+ * periodic reconcile pass (see module doc), so this is the ONLY chance a
+ * post-download-oversize file with a pre-existing live row ever gets to
+ * archive that stale row; skipping it here would strand it forever.
  */
-async function buildItem(raw: DriveItem, root: RootConfig, deps: ItemDeps): Promise<OneDriveItem | null> {
+async function buildItem(
+  raw: DriveItem,
+  root: RootConfig,
+  deps: ItemDeps,
+  deletions: ExternalRef[],
+): Promise<OneDriveItem | null> {
   const mime = raw.file?.mimeType ?? 'application/octet-stream';
   const displayPath = buildDisplayPath({ rootName: root.rootName }, raw);
 
@@ -366,6 +392,10 @@ async function buildItem(raw: DriveItem, root: RootConfig, deps: ItemDeps): Prom
   const postRoute = chooseRoute(mime, raw.name, bytes.byteLength);
   if (postRoute.kind === 'ignore') {
     deps.ignored.add(postRoute.reason);
+    const existing = await deps.query.byExternalId(deps.session.account.id, raw.id, 'file');
+    if (existing && !existing.archivedAt) {
+      deletions.push({ externalId: raw.id, type: 'file' });
+    }
     return null;
   }
 
@@ -452,7 +482,7 @@ async function* pageChunks(
         deps.ignored.add(route.reason);
       } else {
         try {
-          const item = await buildItem(raw, root, deps);
+          const item = await buildItem(raw, root, deps, deletions);
           if (item) {
             items.push(item);
             bytes += item.bytes?.byteLength ?? 0;
