@@ -101,6 +101,55 @@ describe('delta', () => {
     expect(batches[0].deletions).toEqual([{ externalId: 'gone1', type: 'file' }]);
   });
 
+  it('a live doc that turns policy-ineligible (changed to MP3) is archived via exactly one deletion — no item, no download', async () => {
+    const query = fakeQuery([fakeDoc('f1', 'file', { etag: 'etag-f1-1' })]);
+    const pollUrl = deltaUrl('FA', 'T');
+    const { source, calls } = makeSource(
+      {
+        deltaPages: {
+          [pollUrl]: {
+            value: [driveFile('f1', 'song.mp3', { file: { mimeType: 'audio/mpeg' }, eTag: 'etag-f1-2' })],
+            '@odata.deltaLink': `${GRAPH_BASE}/me/drive/items/FA/delta?token=NEW`,
+          },
+        },
+      },
+      query,
+    );
+    const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
+    const cursor: OneDriveCursor = { delta_tokens: { FA: 'T' } };
+
+    const batches = (await collect(source.pull(session, cursor))) as B[];
+
+    expect(batches.flatMap(ids)).toEqual([]);
+    expect(batches.flatMap((b) => b.deletions ?? [])).toEqual([{ externalId: 'f1', type: 'file' }]);
+    expect(calls.some((u) => u.includes('/me/drive/items/f1') && !u.includes('/delta'))).toBe(false);
+    expect(calls.some((u) => u.includes('download.example'))).toBe(false);
+  });
+
+  it('a live doc that turns policy-ineligible (changed to ZIP) is archived via exactly one deletion — no item, no download', async () => {
+    const query = fakeQuery([fakeDoc('f2', 'file', { etag: 'etag-f2-1' })]);
+    const pollUrl = deltaUrl('FA', 'T');
+    const { source, calls } = makeSource(
+      {
+        deltaPages: {
+          [pollUrl]: {
+            value: [driveFile('f2', 'bundle.zip', { file: { mimeType: 'application/zip' }, eTag: 'etag-f2-2' })],
+            '@odata.deltaLink': `${GRAPH_BASE}/me/drive/items/FA/delta?token=NEW`,
+          },
+        },
+      },
+      query,
+    );
+    const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
+    const cursor: OneDriveCursor = { delta_tokens: { FA: 'T' } };
+
+    const batches = (await collect(source.pull(session, cursor))) as B[];
+
+    expect(batches.flatMap(ids)).toEqual([]);
+    expect(batches.flatMap((b) => b.deletions ?? [])).toEqual([{ externalId: 'f2', type: 'file' }]);
+    expect(calls.some((u) => u.includes('download.example'))).toBe(false);
+  });
+
   it('a removed item with NO existing doc emits no deletion ref', async () => {
     const pollUrl = deltaUrl('FA', 'T');
     const { source } = makeSource({

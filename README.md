@@ -52,12 +52,18 @@ folder that overlaps an already-picked one.
 
 ## What gets indexed
 
-- **Files under the picked folders** whose type the platform can extract:
-  PDF, Word (.docx), Excel (.xlsx), CSV/HTML/plain-text and other `text/*`
-  files are downloaded (up to 25 MiB) and converted locally by the engine;
-  images (PNG/JPEG/…) go through the local OCR / vision pipeline.
-- **Everything else** (unrecognized binary types, oversized files) — indexed
-  as metadata-only entries: title, folder path, link, timestamps.
+- Microsoft Graph's delta feed still enumerates every item's metadata under
+  the picked folders, but **content is requested only for files the
+  platform can actually extract**: PDF, Word (.docx), Excel (.xlsx),
+  CSV/HTML/plain-text and other `text/*` files are downloaded (up to 25 MiB)
+  and converted locally by the engine; images (PNG/JPEG/…) up to 20 MiB go
+  through the local OCR / vision pipeline.
+- **Ignored** — no download, no index entry of any kind: cloud audio and
+  video files (regardless of size), archives (.zip, .rar, .7z, and similar,
+  regardless of size), files over the size caps above, and any other
+  unsupported or unrecognized file type. An already-indexed file that a
+  later policy update excludes this way is removed from your index the next
+  time it's seen.
 - **Folder paths** — every document records a human-readable `display_path`
   from the tracked root it was found under (and that root's id as
   `root_folder_id`), taken directly from Graph's own `parentReference.path`.
@@ -82,8 +88,8 @@ are cheap.
 
 - SharePoint document libraries and Teams-only shared drives are not
   indexed — OneDrive "My files" and "Shared with me" folders only.
-- Binary downloads are capped at 25 MiB; larger files are indexed as
-  metadata only.
+- Binary downloads are capped at 25 MiB (20 MiB for images); larger files
+  are ignored, not indexed.
 - A resync (Microsoft Graph occasionally invalidates a delta token) re-walks
   that one root from scratch; already-indexed unchanged files are skipped by
   eTag, so this is cheap but not instant on a large root.

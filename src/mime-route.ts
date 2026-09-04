@@ -1,41 +1,38 @@
 /**
  * Binary-mime routing for OneDrive items. v1 (`ingest.ts`) delegated this to
  * `@main/converter`'s `isConvertibleMime` and ran the extraction ITSELF
- * (download bytes, call the local converter, store markdown). v2 drops that:
- * every downloadable file is emitted with `binary: { bytes, mime, filename }`
- * and `markdown: null`, and the v2 ENGINE's convert/vision pipeline does the
- * extraction — this module only decides which mimes are worth downloading at
- * all (`isConvertibleMime` below is the SAME criterion the google-docs-kia-
- * connector template uses for its own binary route, since it is bound to the
- * same v2 engine: kiagent-core src/main/core/engine/convert.ts:43-84's
- * deterministic converters (pdf, docx, xlsx, any text/*) plus the two-pass
- * vision pipeline's image/* candidates, kiagent-core
- * src/main/workers/vision/classify.ts:48-63).
+ * (download bytes, call the local converter, store markdown). v2 dropped
+ * that: every downloadable file is emitted with `binary: { bytes, mime,
+ * filename }` and `markdown: null`, and the v2 ENGINE's convert/vision
+ * pipeline does the extraction — this module only decides which files are
+ * worth downloading at all.
  *
- * v1's `isConvertibleMime` gate (used only to skip a download, never to route
- * differently) is folded into `chooseRoute` below; images were UNSUPPORTED in
- * v1 (no local OCR) and are BINARY here (the v2 vision pipeline OCRs them via
- * fetchBytes) — a deliberate v2 broadening, not a regression.
+ * v3 (this file) replaces the connector-local `isConvertibleMime` allowlist
+ * with kiagent-core's canonical `decideFileIndexing` policy (via the SDK):
+ * the SAME "can this file be indexed?" gate the local-folder source, the
+ * vision worker, the audio worker and the google-docs-kia-connector template
+ * all derive from, so this connector can no longer drift from them. Under
+ * `profile: 'cloud-drive'` the policy ignores archives at any size, all
+ * cloud audio/video regardless of size, and anything outside its allowlist
+ * — and caps PDFs/Office/text at `MAX_CLOUD_BINARY_BYTES` (25 MiB) and
+ * images at `MAX_CLOUD_IMAGE_BYTES` (20 MiB). See `source.ts`'s `pageChunks`
+ * for where the resulting `ignore` routes gate OUT of any content I/O
+ * entirely (no downloadUrl refresh, no download).
  */
+import { decideFileIndexing, type FileIgnoreReason } from '@kiagent/connector-sdk';
 
-const DOCX_MIME =
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-const XLSX_MIME =
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+export type OneDriveRoute =
+  | { kind: 'binary'; pipeline: 'converter' | 'vision' }
+  | { kind: 'ignore'; reason: FileIgnoreReason };
 
-/** Binary mimes the v2 engine can turn into text — see module doc. */
-export function isConvertibleMime(mimeType: string): boolean {
-  return (
-    mimeType.startsWith('text/') ||
-    mimeType.startsWith('image/') ||
-    mimeType === 'application/pdf' ||
-    mimeType === DOCX_MIME ||
-    mimeType === XLSX_MIME
-  );
-}
-
-export type Route = { kind: 'binary' } | { kind: 'unsupported' };
-
-export function chooseRoute(mimeType: string): Route {
-  return isConvertibleMime(mimeType) ? { kind: 'binary' } : { kind: 'unsupported' };
+export function chooseRoute(mimeType: string, filename: string, sizeBytes?: number): OneDriveRoute {
+  const d = decideFileIndexing({
+    profile: 'cloud-drive',
+    filename,
+    mime: mimeType,
+    sizeBytes,
+  });
+  return d.kind === 'ignore'
+    ? d
+    : { kind: 'binary', pipeline: d.pipeline === 'vision' ? 'vision' : 'converter' };
 }

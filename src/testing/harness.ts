@@ -198,6 +198,7 @@ export function fakeQuery(docs: Document[] = [], accounts: Account[] = []): Quer
     children: unused,
     search: unused,
     count: unused,
+    countBy: unused,
     accounts: async () => accounts,
   };
 }

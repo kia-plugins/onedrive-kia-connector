@@ -13,19 +13,22 @@ import {
   deltaUrl,
   driveFile,
   driveFolder,
+  fakeDoc,
+  fakeQuery,
   graphFetch,
   instantClock,
   jsonRes,
   makeHost,
   makeSession,
 } from '../testing/harness';
+import type { Query } from '@kiagent/connector-sdk';
 
 type B = Batch<OneDriveCursor, OneDriveItem>;
 const ids = (b: B) => b.items.map((i) => i.file.id);
 
-function makeSource(world: Parameters<typeof graphFetch>[0]) {
+function makeSource(world: Parameters<typeof graphFetch>[0], query?: Query) {
   const { fetchFn, calls } = graphFetch(world);
-  const source = createOneDriveSource(makeHost(fetchFn), instantClock);
+  const source = createOneDriveSource(makeHost(fetchFn, query ?? fakeQuery()), instantClock);
   return { source, calls };
 }
 
@@ -152,6 +155,27 @@ describe('backfill', () => {
     expect(batches.flatMap(ids)).toEqual(['shared1']);
     expect(batches[0].items[0].rootFolderId).toBe('FA');
     expect(calls.filter((u) => u === 'https://download.example/shared1')).toHaveLength(1);
+  });
+
+  it('a policy-ineligible file (MP3) with a pre-existing live row is archived via a deletion during BACKFILL — the deletion survives from pageChunks through the yielded batch', async () => {
+    const query = fakeQuery([fakeDoc('f1', 'file', { etag: 'etag-old' })]);
+    const { source } = makeSource(
+      {
+        deltaPages: {
+          [deltaUrl('FA')]: {
+            value: [driveFile('f1', 'song.mp3', { file: { mimeType: 'audio/mpeg' } })],
+            '@odata.deltaLink': `${GRAPH_BASE}/me/drive/items/FA/delta?token=TOK1`,
+          },
+        },
+      },
+      query,
+    );
+    const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
+
+    const batches = (await collect(source.pull(session, null))) as B[];
+
+    expect(batches.flatMap(ids)).toEqual([]);
+    expect(batches.flatMap((b) => b.deletions ?? [])).toEqual([{ externalId: 'f1', type: 'file' }]);
   });
 
   it('folders and the root item itself are never ingested', async () => {

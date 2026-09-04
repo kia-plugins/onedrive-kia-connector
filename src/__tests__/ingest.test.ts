@@ -1,9 +1,11 @@
 /**
  * Ingest/routing suite (v1 ingest.ts parity), exercised through the public
- * pull() API: hash-skip (etag unchanged), the 'failed' row exemption,
- * unsupported-mime metadata-only routing, the 25 MiB size cap (declared and
- * post-download), the downloadUrl-refresh fallback (delta payloads routinely
- * omit the annotation), and the one-shot 403-refresh-and-retry.
+ * pull() API: hash-skip (etag unchanged), the 'failed' row exemption, the SDK
+ * decideFileIndexing eligibility gate (cloud-media/archives/unsupported
+ * ignored before any content I/O, the aggregate per-pull ignore-summary
+ * log), the 25 MiB size cap (declared and post-download), the
+ * downloadUrl-refresh fallback (delta payloads routinely omit the
+ * annotation), and the one-shot 403-refresh-and-retry.
  */
 import { createOneDriveSource, GRAPH_BASE, MAX_BINARY_BYTES, type OneDriveItem } from '../source';
 import type { Batch } from '@kiagent/connector-sdk';
@@ -99,25 +101,74 @@ describe('ingest routing', () => {
     expect(batches[0].items[0].extractionStatus).toBe('ok');
   });
 
-  it('routes an unsupported mime to a metadata-only row (no download)', async () => {
-    const { source, calls } = makeSource({
+  describe('policy-ineligible files are gated out before any content I/O (SDK decideFileIndexing, cloud-drive)', () => {
+    const table: Array<{ label: string; id: string; name: string; mime: string; size?: number }> = [
+      { label: 'MP3 (cloud-media)', id: 'mp3-1', name: 'song.mp3', mime: 'audio/mpeg' },
+      { label: 'MP4 (cloud-media)', id: 'mp4-1', name: 'clip.mp4', mime: 'video/mp4' },
+      { label: 'ZIP (archive)', id: 'zip-1', name: 'bundle.zip', mime: 'application/zip' },
+      { label: '26 MiB ZIP (archive, ignored regardless of size)', id: 'zip-2', name: 'huge.zip', mime: 'application/zip', size: 26 * 1024 * 1024 },
+      { label: 'EXE (unsupported)', id: 'exe-1', name: 'setup.exe', mime: 'application/x-msdownload' },
+      { label: 'octet-stream (unsupported)', id: 'oct-1', name: 'blob.bin', mime: 'application/octet-stream' },
+    ];
+
+    it.each(table)('$label: zero items, zero item-GET, zero download', async ({ id, name, mime, size }) => {
+      const { source, calls } = makeSource({
+        deltaPages: {
+          [deltaUrl('FA')]: {
+            value: [driveFile(id, name, { file: { mimeType: mime }, ...(size != null ? { size } : {}) })],
+            '@odata.deltaLink': finalLink('FA', 'TOK1'),
+          },
+        },
+      });
+      const { session } = makeSession({ config: oneRoot });
+
+      const batches = (await collect(source.pull(session, null))) as B[];
+
+      expect(batches.flatMap((b) => b.items)).toEqual([]);
+      expect(calls.some((u) => u.includes(`/me/drive/items/${id}`) && !u.includes('/delta'))).toBe(false);
+      expect(calls.some((u) => u.includes('download.example'))).toBe(false);
+    });
+  });
+
+  it('logs exactly one aggregate ignore summary per pull, with no filenames — and logs nothing when a pull ignores nothing', async () => {
+    const { source: mixedSource } = makeSource({
       deltaPages: {
         [deltaUrl('FA')]: {
-          value: [driveFile('z1', 'archive.zip', { file: { mimeType: 'application/zip' } })],
+          value: [
+            driveFile('mp3-x', 'secret-song.mp3', { file: { mimeType: 'audio/mpeg' } }),
+            driveFile('zip-x', 'confidential.zip', { file: { mimeType: 'application/zip' } }),
+          ],
           '@odata.deltaLink': finalLink('FA', 'TOK1'),
         },
       },
     });
-    const { session } = makeSession({ config: oneRoot });
+    const { session: mixedSession, logs: mixedLogs } = makeSession({ config: oneRoot });
 
-    const batches = (await collect(source.pull(session, null))) as B[];
+    await collect(mixedSource.pull(mixedSession, null));
 
-    expect(batches[0].items[0]).toMatchObject({ markdown: '', extractionStatus: 'unsupported' });
-    expect(batches[0].items[0].bytes).toBeUndefined();
-    expect(calls.some((u) => u.includes('download.example'))).toBe(false);
+    const summaryLogs = mixedLogs.filter((l) => /ignored \d+ file/.test(l.msg));
+    expect(summaryLogs).toHaveLength(1);
+    expect(summaryLogs[0].level).toBe('info');
+    expect(summaryLogs[0].msg).toBe('onedrive: ignored 2 file(s) this pull (cloud-media=1 archive=1)');
+    expect(summaryLogs[0].msg).not.toMatch(/secret-song|confidential\.zip/);
+
+    const { source: cleanSource } = makeSource({
+      deltaPages: {
+        [deltaUrl('FA')]: {
+          value: [driveFile('f1', 'a.pdf')],
+          '@odata.deltaLink': finalLink('FA', 'TOK1'),
+        },
+      },
+      downloads: { 'https://download.example/f1': new Uint8Array([1]) },
+    });
+    const { session: cleanSession, logs: cleanLogs } = makeSession({ config: oneRoot });
+
+    await collect(cleanSource.pull(cleanSession, null));
+
+    expect(cleanLogs.some((l) => /ignored \d+ file/.test(l.msg))).toBe(false);
   });
 
-  it('skips the download for a declared-too-large file (size field over the cap)', async () => {
+  it('skips all content I/O for a declared-too-large file (size field over the converter/PDF cap) — no item, no item-GET, no download', async () => {
     const { source, calls } = makeSource({
       deltaPages: {
         [deltaUrl('FA')]: {
@@ -130,12 +181,35 @@ describe('ingest routing', () => {
 
     const batches = (await collect(source.pull(session, null))) as B[];
 
-    expect(batches[0].items[0]).toMatchObject({ markdown: '', extractionStatus: 'too-large' });
+    expect(batches.flatMap((b) => b.items)).toEqual([]);
+    expect(calls.some((u) => u.includes('/me/drive/items/big1') && !u.includes('/delta'))).toBe(false);
     expect(calls.some((u) => u.includes('download.example'))).toBe(false);
   });
 
-  it('caps an unknown-size file AFTER download (post-hoc too-large, no bytes emitted)', async () => {
-    const { source } = makeSource({
+  it('the declared-size cap is inclusive: size === cap still downloads, size === cap+1 never reaches an item-GET or download', async () => {
+    const { source, calls } = makeSource({
+      deltaPages: {
+        [deltaUrl('FA')]: {
+          value: [
+            driveFile('atcap', 'exact.pdf', { size: MAX_BINARY_BYTES }),
+            driveFile('overcap', 'over.pdf', { size: MAX_BINARY_BYTES + 1 }),
+          ],
+          '@odata.deltaLink': finalLink('FA', 'TOK1'),
+        },
+      },
+      downloads: { 'https://download.example/atcap': new Uint8Array([1]) },
+    });
+    const { session } = makeSession({ config: oneRoot });
+
+    const batches = (await collect(source.pull(session, null))) as B[];
+
+    expect(batches.flatMap(ids)).toEqual(['atcap']);
+    expect(calls.some((u) => u.includes('/me/drive/items/overcap') && !u.includes('/delta'))).toBe(false);
+    expect(calls.includes('https://download.example/overcap')).toBe(false);
+  });
+
+  it('downloads, then drops, an unknown-declared-size file that turns out oversized post-download (no item emitted)', async () => {
+    const { source, calls } = makeSource({
       deltaPages: {
         [deltaUrl('FA')]: {
           value: [driveFile('nosize1', 'n.pdf', { size: undefined })],
@@ -148,8 +222,10 @@ describe('ingest routing', () => {
 
     const batches = (await collect(source.pull(session, null))) as B[];
 
-    expect(batches[0].items[0]).toMatchObject({ markdown: '', extractionStatus: 'too-large' });
-    expect(batches[0].items[0].bytes).toBeUndefined();
+    expect(batches.flatMap((b) => b.items)).toEqual([]);
+    // Unlike a declared-size cap, this one COULD only be discovered after the
+    // download actually ran (size was unknown going in).
+    expect(calls.some((u) => u.includes('download.example'))).toBe(true);
   });
 
   it('refreshes the downloadUrl when the delta payload omits it, then downloads successfully', async () => {
