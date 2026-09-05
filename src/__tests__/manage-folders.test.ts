@@ -242,6 +242,35 @@ describe('manageFolders', () => {
     expect(out.archiveNullScoped).toBe(true);
   });
 
+  it('C-46 addendum: a coverer ADDED IN THE SAME SAVE re-attributes — widening must not archive', async () => {
+    // The case the first D3 fix missed. Coverage was keyed on `retained`,
+    // i.e. roots present in BOTH the prior config and the pick, so a coverer
+    // the user ADDS in this very save could never cover anything and the
+    // removed root fell through to `archiveScopeRootIds` — a full archive and
+    // re-download of the subtree on the single most likely edit there is
+    // ("stop tracking /Beta, track the whole drive"). Coverage is now decided
+    // against the NEW selection.
+    const { source } = makeSource();
+    const { session } = makeSession({
+      config: { folderRoots: fr(['FB', 'Beta']) },
+      cursor: { delta_tokens: { FB: 'TB' }, scope_roots: ['FB'] } as OneDriveCursor,
+    });
+    const { channel } = makeFolderChannel({
+      picked: [node(ONEDRIVE_DRIVE_ROOT_ID, 'OneDrive')],
+    });
+
+    const out = await source.manageFolders!(session, channel);
+
+    expect(out.archiveScopeRootIds).toEqual([]);
+    expect(out.reattributeScopeRoots).toEqual([
+      { from: 'FB', to: ONEDRIVE_DRIVE_ROOT_ID },
+    ]);
+    expect(out.cursor).toEqual({
+      delta_tokens: {},
+      scope_roots: [ONEDRIVE_DRIVE_ROOT_ID],
+    });
+  });
+
   it('a removed "Shared with me" root is INCOMPARABLE to a My-files root: archived, and no retained token is dropped', async () => {
     const { source } = makeSource();
     const { session } = makeSession({

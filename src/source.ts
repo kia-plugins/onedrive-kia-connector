@@ -1191,23 +1191,32 @@ export function createOneDriveSource(
       if (removed.length > 0) {
         channel.status('Checking which folders are still covered…');
         const where = new Map<string, RootLocation | null>();
+        // C-46 addendum: coverage is decided against the NEW selection, not
+        // against `retained` (the roots that survive from the PRIOR config).
+        // A coverer the user ADDS in the same save — de-selecting `/Beta` in
+        // favour of the drive root, the widening edit D5 exists to make cheap
+        // — is in `picked` but never in `retained`, so keying on `retained`
+        // sent it to `archiveScopeRootIds` and re-downloaded the whole subtree.
+        // Measured before this fix: prior [/Beta] + picked [root] produced
+        // archive ["FB"], reattribute []. `ordered` is the new set in config
+        // order, so the first-match-wins tie-break is unchanged.
         for (const id of [
           ...removed.map((r) => r.rootFolderId),
-          ...retained.map((r) => r.rootFolderId),
+          ...nextIds,
         ]) {
           where.set(id, await resolveRootLocation(client, id));
         }
         for (const r of removed) {
           const loc = where.get(r.rootFolderId) ?? null;
           let coveredBy: string | null = null;
-          for (const k of retained) {
-            const kloc = where.get(k.rootFolderId) ?? null;
+          for (const k of ordered) {
+            const kloc = where.get(k.id) ?? null;
             // A retained ANCESTOR still contains the removed root's whole
             // subtree, so nothing leaves scope and archiving would be wrong
             // (DECISIONS R8). The FIRST such root in config order wins, which
             // is the same tie-break `deps.processed` uses when two roots both
             // contain a file.
-            if (coveredBy === null && covers(kloc, loc)) coveredBy = k.rootFolderId;
+            if (coveredBy === null && covers(kloc, loc)) coveredBy = k.id;
             // Overlap in EITHER direction means first-root-wins attribution
             // (a config-ORDER artifact, `deps.processed`, `:463-468`) may
             // have stamped documents in the shared region with the wrong
@@ -1230,7 +1239,7 @@ export function createOneDriveSource(
             // since `hashSkip` returns false for an archived row) at the cost
             // of a re-download. What it cannot do is move a live row's stamp.
             // `reattributeScopeRoots` below is what closes that gap.
-            if (overlaps(kloc, loc)) dropTokens.add(k.rootFolderId);
+            if (overlaps(kloc, loc) && priorIds.has(k.id)) dropTokens.add(k.id);
           }
           // C-46/D3+D5, the third verb. A covered root must NOT be silently
           // skipped: its live rows stay stamped with the REMOVED id, and a
