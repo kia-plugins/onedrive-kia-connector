@@ -107,8 +107,13 @@ describe('batch byte budget', () => {
     expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'NEW' } });
   });
 
-  it('delta: the item limit flushes metadata-only items too, and each deletion lands in exactly one chunk', async () => {
+  it('delta: the item limit flushes policy deletions too, and each deletion (upstream tombstone or policy transition) lands in exactly one chunk', async () => {
     const pollUrl = deltaUrl('FA', 'OLD');
+    // f1/f2/f3 are now-unsupported .exe files that each have a pre-existing
+    // live row — under the eligibility gate they never become `items`
+    // (metadata-only rows no longer exist for ignored routes); each is
+    // surfaced as a policy DELETION instead, exactly like an upstream
+    // tombstone, and counts against the same item limit.
     const unsupported = { file: { mimeType: 'application/x-msdownload' } };
     const { source } = makeSource(
       {
@@ -126,18 +131,24 @@ describe('batch byte budget', () => {
         },
       },
       { batchItemLimit: 2 },
-      fakeQuery([fakeDoc('gone1', 'file', {}), fakeDoc('gone2', 'file', {})]),
+      fakeQuery([
+        fakeDoc('gone1', 'file', {}),
+        fakeDoc('f1', 'file', {}),
+        fakeDoc('f2', 'file', {}),
+        fakeDoc('f3', 'file', {}),
+        fakeDoc('gone2', 'file', {}),
+      ]),
     );
     const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
 
     const batches = (await collect(source.pull(session, { delta_tokens: { FA: 'OLD' } }))) as B[];
 
-    // Deletions count against the limit like items: [gone1,f1] [f2,f3] [gone2]
     expect(batches.map((b) => [...(b.deletions ?? []).map((d) => d.externalId), ...ids(b)])).toEqual([
       ['gone1', 'f1'],
       ['f2', 'f3'],
       ['gone2'],
     ]);
+    expect(batches.every((b) => ids(b).length === 0)).toBe(true);
     expect(batches.slice(0, -1).every((b) => b.cursor.delta_tokens.FA === 'OLD')).toBe(true);
     expect(batches.at(-1)!.cursor).toEqual({ delta_tokens: { FA: 'NEW' } });
   });

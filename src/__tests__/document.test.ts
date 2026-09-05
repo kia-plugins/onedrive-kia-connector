@@ -1,7 +1,7 @@
 /**
  * toDocument (pure) and fetchBytes (deep-extraction re-fetch) suite.
  */
-import { createOneDriveSource, type OneDriveItem } from '../source';
+import { createOneDriveSource, MAX_BINARY_BYTES, type OneDriveItem } from '../source';
 import { GraphApiError } from '../client';
 import type { DocumentInput } from '@kiagent/connector-sdk';
 import { driveFile, fakeDoc, graphFetch, instantClock, jsonRes, makeHost, makeSession } from '../testing/harness';
@@ -54,7 +54,7 @@ describe('toDocument', () => {
     const item: OneDriveItem = {
       file: driveFile('z1', 'archive.zip', { file: { mimeType: 'application/zip' } }),
       markdown: '',
-      extractionStatus: 'unsupported',
+      extractionStatus: 'failed',
       displayPath: 'Alpha / archive.zip',
       rootFolderId: 'FA',
     };
@@ -127,6 +127,47 @@ describe('fetchBytes', () => {
 
     await expect(source.fetchBytes!(session, doc)).resolves.toBeNull();
     expect(calls).toHaveLength(0);
+  });
+
+  it('returns null for cloud-media (MP3) without fetching — ignored MIME never reaches an item GET', async () => {
+    const { source, calls } = makeSource();
+    const { session } = makeSession();
+    const doc = fakeDoc('m1', 'file', {
+      drive_item_id: 'm1',
+      mime_type: 'audio/mpeg',
+      filename: 'song.mp3',
+      size_bytes: 10,
+    });
+
+    await expect(source.fetchBytes!(session, doc)).resolves.toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  it('the size cap is inclusive: size === cap still fetches; size === cap+1 returns null before any item GET', async () => {
+    const { source, calls } = makeSource({
+      items: {
+        atcap: { id: 'atcap', name: 'exact.pdf', '@microsoft.graph.downloadUrl': 'https://download.example/atcap' },
+      },
+      downloads: { 'https://download.example/atcap': new Uint8Array([3, 3]) },
+    });
+    const { session } = makeSession();
+    const atCapDoc = fakeDoc('atcap', 'file', {
+      drive_item_id: 'atcap',
+      mime_type: 'application/pdf',
+      size_bytes: MAX_BINARY_BYTES,
+    });
+
+    await expect(source.fetchBytes!(session, atCapDoc)).resolves.toEqual(new Uint8Array([3, 3]));
+    expect(calls.some((u) => u.includes('/me/drive/items/atcap'))).toBe(true);
+
+    const overCapDoc = fakeDoc('overcap', 'file', {
+      drive_item_id: 'overcap',
+      mime_type: 'application/pdf',
+      size_bytes: MAX_BINARY_BYTES + 1,
+    });
+
+    await expect(source.fetchBytes!(session, overCapDoc)).resolves.toBeNull();
+    expect(calls.some((u) => u.includes('/me/drive/items/overcap'))).toBe(false);
   });
 
   it('returns null when the item is gone upstream (404/410)', async () => {

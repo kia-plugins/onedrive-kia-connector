@@ -28,13 +28,25 @@
  *    emits `binary: { bytes, mime, filename }` with `markdown: null` for
  *    every downloadable file — the engine's convert/vision pipeline extracts
  *    it (mirrors the google-docs-kia-connector template's binary route). See
- *    mime-route.ts for the mime gate this replaces v1's `isConvertibleMime`
- *    with — broadened to include images (v1 left images unsupported; the v2
- *    vision worker OCRs them via `fetchBytes`).
- *  - A 25 MiB download cap (`MAX_BINARY_BYTES`) is ADDED: v1 had none (v1 gap
- *    — the same one the google-docs-kia-connector template called out and
- *    fixed for Drive). An oversized file is indexed as metadata-only
- *    (`extraction_status: 'too-large'`) instead of downloaded.
+ *    mime-route.ts for the routing gate this replaces v1's local
+ *    `isConvertibleMime` with — broadened to include images (v1 left images
+ *    unsupported; the v2 vision worker OCRs them via `fetchBytes`).
+ *  - Content eligibility is now decided by kiagent-core's canonical
+ *    `decideFileIndexing` policy (via the SDK's `chooseRoute` — see
+ *    mime-route.ts), consulted in `pageChunks` BEFORE any downloadUrl
+ *    refresh or download. Archives (any size), cloud audio/video (any
+ *    size), unsupported types, and oversized files (converter/PDF over
+ *    `MAX_CLOUD_BINARY_BYTES` = 25 MiB, images over `MAX_CLOUD_IMAGE_BYTES` =
+ *    20 MiB) are ignored outright — no metadata-only row is produced for
+ *    them, and an already-indexed file the policy now excludes is archived
+ *    (see the ignore branch of `pageChunks`, and `buildItem`'s post-download
+ *    re-check for the declared-size-absent case — this connector has no
+ *    reconcile pass, so these two sites are the only places that will ever
+ *    clean up such a row). v1 had no size cap at all (a
+ *    gap the google-docs-kia-connector template called out and fixed for
+ *    Drive first). A file whose declared `size` is absent is admitted
+ *    provisionally and re-checked against the same policy once its real
+ *    byte length is known post-download.
  *  - Tracked-root OVERLAP VALIDATION (v1's overlap.ts) is DROPPED: v1 needed
  *    it because its own folder-picker UI let a user select a folder inside
  *    an already-tracked one. The v2 contract's shared `pickFolders` already
@@ -73,11 +85,13 @@ import type {
   Document,
   DocumentInput,
   ExternalRef,
+  FileIgnoreReason,
   HostFor,
   Query,
   Session,
   Source,
 } from '@kiagent/connector-sdk';
+import { MAX_CLOUD_BINARY_BYTES } from '@kiagent/connector-sdk';
 import {
   GRAPH_BASE,
   GraphApiError,
@@ -87,7 +101,7 @@ import {
   type GraphClientDeps,
 } from './client';
 import { buildDisplayPath } from './path-resolver';
-import { isConvertibleMime } from './mime-route';
+import { chooseRoute } from './mime-route';
 import { countChildren, listChildFolders, listSharedRoots } from './tree';
 
 export { GRAPH_BASE };
@@ -97,8 +111,12 @@ export { GRAPH_BASE };
  *  extension only requests Graph RESOURCE scopes). */
 export const FILES_SCOPES = ['Files.Read.All', 'User.Read'];
 
-/** v1 had NO cap (whole file into a Buffer) — v2 binds one (see module doc). */
-export const MAX_BINARY_BYTES = 25 * 1024 * 1024;
+/** v1 had NO cap (whole file into a Buffer) — v2 binds one (see module doc).
+ *  Re-exported from the SDK's canonical `MAX_CLOUD_BINARY_BYTES` under this
+ *  connector's original name so existing callers/tests are undisturbed; the
+ *  actual cap enforcement lives entirely in `decideFileIndexing` now (via
+ *  `chooseRoute`), not in a local comparison against this constant. */
+export const MAX_BINARY_BYTES = MAX_CLOUD_BINARY_BYTES;
 
 /**
  * Per-batch flush budget. A Graph delta page is server-sized (typically a
@@ -152,11 +170,14 @@ export interface DriveItem {
 
 export interface OneDriveItem {
   file: DriveItem;
-  /** '' for metadata-only rows (no binary, no conversion enrollment); null
-   *  for binary items (the engine converts). */
+  /** '' for the one remaining metadata-only case (downloadUrl unobtainable,
+   *  `extractionStatus: 'failed'`) — a file the eligibility policy has
+   *  already ruled IN never reaches this type at all when the policy rules
+   *  it OUT (see `pageChunks`'s ignore branch, which never calls
+   *  `buildItem`). null for binary items (the engine converts). */
   markdown: string | null;
   bytes?: Uint8Array;
-  extractionStatus: 'ok' | 'unsupported' | 'too-large' | 'failed';
+  extractionStatus: 'ok' | 'failed';
   displayPath: string;
   rootFolderId: string;
 }
@@ -207,6 +228,38 @@ async function requireToken(session: Session): Promise<string> {
   return creds.accessToken;
 }
 
+/** Aggregate ignore-reason counter for ONE `pull()` call — never holds a
+ *  filename or path, only counts by `FileIgnoreReason`. Shared (via
+ *  `ItemDeps.ignored`) across every root and page a single `backfill()` or
+ *  `delta()` walks, so `logIfAny` fires at most once per completed pull. */
+class IgnoreTally {
+  private readonly counts = new Map<FileIgnoreReason, number>();
+
+  add(reason: FileIgnoreReason): void {
+    this.counts.set(reason, (this.counts.get(reason) ?? 0) + 1);
+  }
+
+  get total(): number {
+    let sum = 0;
+    for (const n of this.counts.values()) sum += n;
+    return sum;
+  }
+
+  private summary(): string {
+    return [...this.counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([reason, n]) => `${reason}=${n}`)
+      .join(' ');
+  }
+
+  /** No-op when nothing was ignored — a pull with full eligibility logs
+   *  nothing extra. */
+  logIfAny(session: Session): void {
+    if (this.total === 0) return;
+    session.log('info', `onedrive: ignored ${this.total} file(s) this pull (${this.summary()})`);
+  }
+}
+
 interface ItemDeps {
   client: GraphClient;
   session: Session;
@@ -216,30 +269,42 @@ interface ItemDeps {
    *  configured roots (see module doc). */
   processed: Set<string>;
   budget: BatchBudget;
+  /** Eligibility-ignore counts for this pull() call (see `pageChunks`'s
+   *  ignore branch and `buildItem`'s post-download re-check). */
+  ignored: IgnoreTally;
 }
 
 /** Query-first content-hash skip: an unchanged, still-live document is never
  *  re-downloaded (v1 ingest.ts's `canShortcut`, minus the metadata-only
  *  `last_seen_at` refresh — the v2 engine owns row freshness). An ARCHIVED
  *  match does NOT skip: re-emitting is what un-archives a doc that moved back
- *  into scope. A 'failed' row is never pinned behind an unchanged eTag —
- *  v1's exact rationale (possibly just a quota storm; must retry). */
+ *  into scope. Only an `'ok'` row (real, already-fetched content) is ever
+ *  pinned behind an unchanged eTag. Anything else bypasses the pin: a
+ *  'failed' row (v1's exact rationale — possibly just a quota storm; must
+ *  retry) AND, just as importantly, a row carrying one of the PRE-migration
+ *  statuses this connector used to write for an ineligible file
+ *  (`'unsupported'`/`'too-large'`) — `pageChunks` only ever calls `hashSkip`
+ *  for an item the CURRENT policy has judged eligible, so reaching here at
+ *  all means a legacy row that used to be ineligible was just newly rescued
+ *  by a policy change (e.g. an octet-stream-mime `.pdf` rescued by its
+ *  extension). Pinning it on an unchanged eTag would strand it as
+ *  contentless metadata forever, since nothing else in this connector will
+ *  ever revisit it. */
 async function hashSkip(deps: ItemDeps, itemId: string, etag: string | undefined): Promise<boolean> {
   if (!etag) return false;
   const existing = await deps.query.byExternalId(deps.session.account.id, itemId, 'file');
   if (!existing || existing.archivedAt) return false;
   const meta = existing.metadata as Record<string, unknown>;
-  if (meta.extraction_status === 'failed') return false;
+  if (meta.extraction_status !== 'ok') return false;
   return meta.etag === etag;
 }
 
-function metadataOnly(
-  raw: DriveItem,
-  extractionStatus: 'unsupported' | 'too-large' | 'failed',
-  displayPath: string,
-  rootFolderId: string,
-): OneDriveItem {
-  return { file: raw, markdown: '', extractionStatus, displayPath, rootFolderId };
+/** The one remaining metadata-only case: an eligible file whose downloadUrl
+ *  could not be obtained even after a refresh (v1 parity — see `buildItem`).
+ *  Ineligible files never reach here at all (`pageChunks` gates them out
+ *  before `buildItem` is ever called). */
+function failedItem(raw: DriveItem, displayPath: string, rootFolderId: string): OneDriveItem {
+  return { file: raw, markdown: '', extractionStatus: 'failed', displayPath, rootFolderId };
 }
 
 /** Do NOT pass `$select` here (v1 `refreshItemDownloadUrl` parity):
@@ -268,19 +333,31 @@ async function downloadBytes(
 }
 
 /**
- * Route one listed/changed item into an OneDriveItem (or null to skip it via
- * hash-skip). May do I/O (downloadUrl refresh / bytes download) — toDocument
- * stays pure.
+ * Route one already-eligible (`chooseRoute` in `pageChunks` already ruled it
+ * IN) listed/changed item into an OneDriveItem, or null to skip it — via
+ * hash-skip, or because a declared-size-absent file turns out oversized once
+ * its real byte length is known. May do I/O (downloadUrl refresh / bytes
+ * download) — toDocument stays pure. Never called for a route `chooseRoute`
+ * ruled OUT (see `pageChunks`'s ignore branch).
+ *
+ * `deletions` is the caller's (`pageChunks`'s) in-progress chunk array,
+ * passed through so the post-download re-check below can push into it
+ * directly — the exact same "was this id already a live row?" pattern
+ * `pageChunks`'s own pre-check ignore branch uses. This connector has no
+ * periodic reconcile pass (see module doc), so this is the ONLY chance a
+ * post-download-oversize file with a pre-existing live row ever gets to
+ * archive that stale row; skipping it here would strand it forever.
  */
-async function buildItem(raw: DriveItem, root: RootConfig, deps: ItemDeps): Promise<OneDriveItem | null> {
+async function buildItem(
+  raw: DriveItem,
+  root: RootConfig,
+  deps: ItemDeps,
+  deletions: ExternalRef[],
+): Promise<OneDriveItem | null> {
   const mime = raw.file?.mimeType ?? 'application/octet-stream';
   const displayPath = buildDisplayPath({ rootName: root.rootName }, raw);
 
   if (await hashSkip(deps, raw.id, raw.eTag)) return null;
-
-  if (!isConvertibleMime(mime)) {
-    return metadataOnly(raw, 'unsupported', displayPath, root.rootFolderId);
-  }
 
   // v1 ingest.ts: Graph's per-item /delta response routinely omits
   // @microsoft.graph.downloadUrl (especially on MSA personal OneDrive) —
@@ -290,10 +367,7 @@ async function buildItem(raw: DriveItem, root: RootConfig, deps: ItemDeps): Prom
     downloadUrl = await refreshDownloadUrl(deps.client, raw.id);
   }
   if (!downloadUrl) {
-    return metadataOnly(raw, 'failed', displayPath, root.rootFolderId);
-  }
-  if (Number(raw.size ?? 0) > MAX_BINARY_BYTES) {
-    return metadataOnly(raw, 'too-large', displayPath, root.rootFolderId);
+    return failedItem(raw, displayPath, root.rootFolderId);
   }
 
   let bytes: Uint8Array;
@@ -308,10 +382,21 @@ async function buildItem(raw: DriveItem, root: RootConfig, deps: ItemDeps): Prom
       throw e;
     }
   }
-  // Post-download cap: OneDrive items virtually always carry `size`, but the
-  // cap is the guarantee — an unknown-size file must not slip past it.
-  if (bytes.byteLength > MAX_BINARY_BYTES) {
-    return metadataOnly(raw, 'too-large', displayPath, root.rootFolderId);
+  // Post-download re-check: `pageChunks`'s pre-check already applied the
+  // policy's declared-size cap when Graph's `size` field was present. This
+  // only matters when `size` was absent (admitted provisionally) and the
+  // real byte length now exceeds the pipeline's cap — re-running the SAME
+  // policy (rather than a flat local constant) keeps the check correct per
+  // pipeline (25 MiB converter/PDF vs 20 MiB images) without duplicating the
+  // SDK's caps here.
+  const postRoute = chooseRoute(mime, raw.name, bytes.byteLength);
+  if (postRoute.kind === 'ignore') {
+    deps.ignored.add(postRoute.reason);
+    const existing = await deps.query.byExternalId(deps.session.account.id, raw.id, 'file');
+    if (existing && !existing.archivedAt) {
+      deletions.push({ externalId: raw.id, type: 'file' });
+    }
+    return null;
   }
 
   return {
@@ -341,8 +426,12 @@ interface PageChunk {
  * cross `deps.budget` (see BATCH_BYTE_BUDGET). Always ends with exactly one
  * `pageComplete` chunk (possibly empty) unless the session is aborted.
  * Folders (no `.file` facet) and the root item itself are never ingested
- * (v1 parity). Deletions are cheap but count against the entry limit so a
- * mass-delete page is still bounded.
+ * (v1 parity). Every live `.file` item is classified via `chooseRoute`
+ * BEFORE `hashSkip`/`buildItem` even run: an ineligible file never reaches a
+ * downloadUrl refresh or a download, and — if it was previously indexed —
+ * is surfaced as a deletion instead. Deletions (upstream tombstones and
+ * policy transitions alike) are cheap but count against the entry limit so
+ * a mass-delete page is still bounded.
  */
 async function* pageChunks(
   page: GraphDeltaPage,
@@ -377,17 +466,33 @@ async function* pageChunks(
       continue;
     } else {
       deps.processed.add(raw.id);
-      try {
-        const item = await buildItem(raw, root, deps);
-        if (item) {
-          items.push(item);
-          bytes += item.bytes?.byteLength ?? 0;
+      const mime = raw.file.mimeType ?? 'application/octet-stream';
+      const sizeBytes = typeof raw.size === 'number' ? raw.size : undefined;
+      const route = chooseRoute(mime, raw.name, sizeBytes);
+      if (route.kind === 'ignore') {
+        // A local eligibility transition — NOT gated by `opts.includeDeletions`
+        // (that flag scopes only upstream `raw.deleted` tombstones): an
+        // already-indexed file the policy now excludes must still be
+        // archived out, including one encountered during backfill. No
+        // downloadUrl refresh or download ever happens for it.
+        const existing = await deps.query.byExternalId(deps.session.account.id, raw.id, 'file');
+        if (existing && !existing.archivedAt) {
+          deletions.push({ externalId: raw.id, type: 'file' });
         }
-      } catch (e) {
-        if (isAuthError(e)) throw e;
-        // One unreadable item must not abort the walk (v1 parity: backfill.ts
-        // / delta.ts both log-and-continue on a per-item error).
-        deps.session.log('warn', `onedrive: item ${raw.id} skipped: ${errText(e)}`);
+        deps.ignored.add(route.reason);
+      } else {
+        try {
+          const item = await buildItem(raw, root, deps, deletions);
+          if (item) {
+            items.push(item);
+            bytes += item.bytes?.byteLength ?? 0;
+          }
+        } catch (e) {
+          if (isAuthError(e)) throw e;
+          // One unreadable item must not abort the walk (v1 parity: backfill.ts
+          // / delta.ts both log-and-continue on a per-item error).
+          deps.session.log('warn', `onedrive: item ${raw.id} skipped: ${errText(e)}`);
+        }
       }
     }
     if (full()) yield flush(false);
@@ -485,7 +590,7 @@ async function* backfill(
   processed: Set<string>,
   budget: BatchBudget,
 ): AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>> {
-  const deps: ItemDeps = { client, session, query, fetchFn, processed, budget };
+  const deps: ItemDeps = { client, session, query, fetchFn, processed, budget, ignored: new IgnoreTally() };
   if (roots.length === 0) {
     yield { phase: 'live', items: [], cursor: { delta_tokens: cursor?.delta_tokens ?? {} } };
     return;
@@ -521,23 +626,24 @@ async function* backfill(
     for await (const step of walkRootToDeltaLink(client, root, deps, startUrl, false)) {
       if (session.signal.aborted) return;
       if (!step.pageComplete) {
-        yield { phase: 'backfill', items: step.items, cursor: pageCursor };
+        yield { phase: 'backfill', items: step.items, deletions: step.deletions, cursor: pageCursor };
       } else if (step.token != null) {
         deltaTokens[root.rootFolderId] = step.token;
         const more = i + 1 < roots.length;
         const nextCursor: OneDriveCursor = more
           ? { delta_tokens: { ...deltaTokens }, backfill: { root_index: i + 1 } }
           : { delta_tokens: { ...deltaTokens } };
-        yield { phase: more ? 'backfill' : 'live', items: step.items, cursor: nextCursor };
+        yield { phase: more ? 'backfill' : 'live', items: step.items, deletions: step.deletions, cursor: nextCursor };
       } else {
         pageCursor = {
           delta_tokens: { ...deltaTokens },
           backfill: { root_index: i, next_link: step.nextLink },
         };
-        yield { phase: 'backfill', items: step.items, cursor: pageCursor };
+        yield { phase: 'backfill', items: step.items, deletions: step.deletions, cursor: pageCursor };
       }
     }
   }
+  deps.ignored.logIfAny(session);
 }
 
 /** Establishes ONE root fully, always yielding `phase: 'live'` batches (no
@@ -553,7 +659,12 @@ async function* establishRootLive(
   for await (const step of walkRootToDeltaLink(client, root, deps, startUrl, false)) {
     if (deps.session.signal.aborted) return;
     if (step.token != null) deltaTokens[root.rootFolderId] = step.token;
-    yield { phase: 'live', items: step.items, cursor: { delta_tokens: { ...deltaTokens } } };
+    yield {
+      phase: 'live',
+      items: step.items,
+      deletions: step.deletions,
+      cursor: { delta_tokens: { ...deltaTokens } },
+    };
   }
 }
 
@@ -608,7 +719,7 @@ async function* delta(
   processed: Set<string>,
   budget: BatchBudget,
 ): AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>> {
-  const deps: ItemDeps = { client, session, query, fetchFn, processed, budget };
+  const deps: ItemDeps = { client, session, query, fetchFn, processed, budget, ignored: new IgnoreTally() };
   const deltaTokens: Record<string, string> = { ...cursor.delta_tokens };
 
   for (const root of roots) {
@@ -632,6 +743,7 @@ async function* delta(
       yield* establishRootLive(client, root, deps, deltaTokens);
     }
   }
+  deps.ignored.logIfAny(session);
 }
 
 export interface OneDriveTestSeams extends Partial<Pick<GraphClientDeps, 'sleep' | 'random'>> {
@@ -773,15 +885,18 @@ export function createOneDriveSource(
     /** Random-access bytes for the engine's deep-extraction passes (the
      *  vision worker's OCR/VLM two-pass pulls image/pdf bytes back through
      *  here). Pre-signed download URLs expire, so this always fetches a
-     *  fresh one rather than trusting anything cached in metadata. */
+     *  fresh one rather than trusting anything cached in metadata.
+     *  Classifies from stored metadata FIRST — an ignored route returns null
+     *  before any client/OAuth/network work happens at all (no
+     *  `clientFor(session)`, no downloadUrl refresh). */
     async fetchBytes(session: Session, doc: Document): Promise<Uint8Array | null> {
       const meta = doc.metadata as Record<string, unknown>;
       const itemId = meta.drive_item_id;
       if (typeof itemId !== 'string' || !itemId) return null;
       const mime = typeof meta.mime_type === 'string' ? meta.mime_type : '';
-      if (!isConvertibleMime(mime)) return null;
-      const size = Number(meta.size_bytes ?? 0);
-      if (Number.isFinite(size) && size > MAX_BINARY_BYTES) return null;
+      const filename = typeof meta.filename === 'string' ? meta.filename : (doc.title ?? '');
+      const size = typeof meta.size_bytes === 'number' ? meta.size_bytes : undefined;
+      if (chooseRoute(mime, filename, size).kind === 'ignore') return null;
       const client = clientFor(session);
       try {
         const downloadUrl = await refreshDownloadUrl(client, itemId);
