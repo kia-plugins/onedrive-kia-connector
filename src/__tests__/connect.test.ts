@@ -15,7 +15,7 @@ import {
 } from '../testing/harness';
 
 describe('connect', () => {
-  it('oauth happy path: scope, statuses, identifier = mail, picked folders → roots config', async () => {
+  it('oauth happy path: scope, statuses, identifier = mail, picked folders → folderRoots config', async () => {
     const { fetchFn, calls } = graphFetch({ about: { mail: 'ed@example.com' } });
     const source = createOneDriveSource(makeHost(fetchFn), instantClock);
     const { auth, statuses, getScopes } = makeAuth({
@@ -32,9 +32,9 @@ describe('connect', () => {
     expect(res).toEqual({
       identifier: 'ed@example.com',
       config: {
-        roots: [
-          { rootFolderId: 'FOLD1', rootName: 'Projects' },
-          { rootFolderId: 'SH1', rootName: 'Shared specs' },
+        folderRoots: [
+          { id: 'FOLD1', name: 'Projects' },
+          { id: 'SH1', name: 'Shared specs' },
         ],
       },
     });
@@ -65,6 +65,9 @@ describe('connect', () => {
       { key: 'shared', label: 'Shared with me' },
     ]);
     expect(spec.multiSelect).toBe(true);
+    expect(spec.purpose).toBe('connect');
+    // Connect has nothing to preselect — that is manageFolders' job.
+    expect(spec.selected).toBeUndefined();
   });
 
   it("spec.roots('my-files') is the static OneDrive-root node — no API call", async () => {
@@ -142,87 +145,22 @@ describe('connect', () => {
   });
 });
 
-describe('reconnect after auth failure keeps the stored selection', () => {
-  const about = { mail: 'ed@example.com' };
-
-  it('skips the picker and returns the prior config verbatim', async () => {
-    const { fetchFn, calls } = graphFetch({ about });
-    const prior = fakeAccount({
-      config: { roots: [{ rootFolderId: 'OLD1', rootName: 'Kept' }] },
-    });
+describe('connect no longer restores by identifier', () => {
+  it('a needsReauth account with the same identifier does NOT skip the picker — reconnect is reauthenticate()', async () => {
+    const { fetchFn } = graphFetch({ about: { mail: 'ed@example.com' } });
+    const prior = fakeAccount({ config: { folderRoots: [{ id: 'OLD1', name: 'Kept' }] } });
     const source = createOneDriveSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
-    const { auth, statuses, getPickerSpec } = makeAuth();
-
-    const res = await source.connect(auth);
-
-    expect(res).toEqual({ identifier: 'ed@example.com', config: prior.config });
-    expect(getPickerSpec()).toBeUndefined();
-    expect(statuses).toEqual([
-      'Waiting for Microsoft sign-in…',
-      'Fetching Microsoft profile…',
-      'Restoring previous folder selection…',
-    ]);
-    // Only the /me call — no folder lookups on the restore path.
-    expect(calls).toHaveLength(1);
-  });
-
-  it('restores when the identifier came from the userPrincipalName fallback', async () => {
-    const { fetchFn } = graphFetch({ about: { userPrincipalName: 'ed@tenant.onmicrosoft.com' } });
-    const prior = fakeAccount({
-      identifier: 'ed@tenant.onmicrosoft.com',
-      config: { roots: [{ rootFolderId: 'OLD1', rootName: 'Kept' }] },
-    });
-    const source = createOneDriveSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
-    const { auth, getPickerSpec } = makeAuth();
-
-    const res = await source.connect(auth);
-
-    expect(res).toEqual({ identifier: 'ed@tenant.onmicrosoft.com', config: prior.config });
-    expect(getPickerSpec()).toBeUndefined();
-  });
-
-  it('a healthy account with the same identifier still runs the picker', async () => {
-    const { fetchFn } = graphFetch({ about });
-    const prior = fakeAccount({
-      status: 'live',
-      config: { roots: [{ rootFolderId: 'OLD1', rootName: 'Kept' }] },
-    });
-    const source = createOneDriveSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
-    const { auth, getPickerSpec } = makeAuth({
+    const { auth, statuses, getPickerSpec } = makeAuth({
       picked: [{ id: 'NEW1', name: 'New', hasChildren: true }],
     });
 
     const res = await source.connect(auth);
 
     expect(getPickerSpec()).toBeDefined();
-    expect(res.config).toEqual({ roots: [{ rootFolderId: 'NEW1', rootName: 'New' }] });
-  });
-
-  it('a needsReauth account under a different identity does not hijack the flow', async () => {
-    const { fetchFn } = graphFetch({ about });
-    const prior = fakeAccount({ identifier: 'other@example.com' });
-    const source = createOneDriveSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
-    const { auth, getPickerSpec } = makeAuth({
-      picked: [{ id: 'NEW1', name: 'New', hasChildren: true }],
+    expect(statuses).toEqual(['Waiting for Microsoft sign-in…', 'Fetching Microsoft profile…']);
+    expect(res).toEqual({
+      identifier: 'ed@example.com',
+      config: { folderRoots: [{ id: 'NEW1', name: 'New' }] },
     });
-
-    const res = await source.connect(auth);
-
-    expect(getPickerSpec()).toBeDefined();
-    expect(res.identifier).toBe('ed@example.com');
-    expect(res.config).toEqual({ roots: [{ rootFolderId: 'NEW1', rootName: 'New' }] });
-  });
-
-  it("another source's needsReauth account with the same identifier is ignored", async () => {
-    const { fetchFn } = graphFetch({ about });
-    const prior = fakeAccount({ source: 'ms365' });
-    const source = createOneDriveSource(makeHost(fetchFn, fakeQuery([], [prior])), instantClock);
-    const { auth, getPickerSpec } = makeAuth({
-      picked: [{ id: 'NEW1', name: 'New', hasChildren: true }],
-    });
-
-    await source.connect(auth);
-
-    expect(getPickerSpec()).toBeDefined();
   });
 });

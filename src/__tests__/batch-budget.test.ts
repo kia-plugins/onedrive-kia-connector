@@ -77,8 +77,8 @@ describe('batch byte budget', () => {
     expect(batches.map((b) => b.phase)).toEqual(['live', 'live']);
     // Intermediate chunk: cursor that fetched the page (old token) — a crash
     // after this commit replays the page, never skips it.
-    expect(batches[0].cursor).toEqual({ delta_tokens: { FA: 'OLD' } });
-    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'NEW' } });
+    expect(batches[0].cursor).toEqual({ delta_tokens: { FA: 'OLD' }, scope_roots: ['FA'] });
+    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'NEW' }, scope_roots: ['FA'] });
   });
 
   it('delta: a budget hit on the last item still advances the token via a trailing empty chunk', async () => {
@@ -103,8 +103,8 @@ describe('batch byte budget', () => {
     const batches = (await collect(source.pull(session, { delta_tokens: { FA: 'OLD' } }))) as B[];
 
     expect(batches.map(ids)).toEqual([['f1', 'f2'], []]);
-    expect(batches[0].cursor).toEqual({ delta_tokens: { FA: 'OLD' } });
-    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'NEW' } });
+    expect(batches[0].cursor).toEqual({ delta_tokens: { FA: 'OLD' }, scope_roots: ['FA'] });
+    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'NEW' }, scope_roots: ['FA'] });
   });
 
   it('delta: the item limit flushes policy deletions too, and each deletion (upstream tombstone or policy transition) lands in exactly one chunk', async () => {
@@ -150,7 +150,7 @@ describe('batch byte budget', () => {
     ]);
     expect(batches.every((b) => ids(b).length === 0)).toBe(true);
     expect(batches.slice(0, -1).every((b) => b.cursor.delta_tokens.FA === 'OLD')).toBe(true);
-    expect(batches.at(-1)!.cursor).toEqual({ delta_tokens: { FA: 'NEW' } });
+    expect(batches.at(-1)!.cursor).toEqual({ delta_tokens: { FA: 'NEW' }, scope_roots: ['FA'] });
   });
 
   it('delta: a deletion reported by two overlapping roots is surfaced once per pull', async () => {
@@ -184,7 +184,7 @@ describe('batch byte budget', () => {
     const batches = (await collect(source.pull(session, { delta_tokens: { FA: 'TA', FB: 'TB' } }))) as B[];
 
     expect(batches.flatMap((b) => (b.deletions ?? []).map((d) => d.externalId))).toEqual(['gone1']);
-    expect(batches.at(-1)!.cursor).toEqual({ delta_tokens: { FA: 'TA2', FB: 'TB2' } });
+    expect(batches.at(-1)!.cursor).toEqual({ delta_tokens: { FA: 'TA2', FB: 'TB2' }, scope_roots: ['FA', 'FB'] });
   });
 
   it('backfill: intermediate chunks repeat the cursor that fetched the page; the final chunk stores the nextLink', async () => {
@@ -216,11 +216,19 @@ describe('batch byte budget', () => {
     expect(batches.map(ids)).toEqual([['f1', 'f2'], [], ['f3', 'f4'], ['f5']]);
     expect(batches.map((b) => b.phase)).toEqual(['backfill', 'backfill', 'backfill', 'live']);
     // Page 1 fetched from the start URL → its intermediate chunk has NO next_link.
-    expect(batches[0].cursor).toEqual({ delta_tokens: {}, backfill: { root_index: 0 } });
-    expect(batches[1].cursor).toEqual({ delta_tokens: {}, backfill: { root_index: 0, next_link: page2 } });
+    expect(batches[0].cursor).toEqual({ delta_tokens: {}, scope_roots: ['FA'], backfill: { root_index: 0 } });
+    expect(batches[1].cursor).toEqual({
+      delta_tokens: {},
+      scope_roots: ['FA'],
+      backfill: { root_index: 0, next_link: page2 },
+    });
     // Page 2's intermediate chunk repeats page 2's own link — a replay refetches page 2.
-    expect(batches[2].cursor).toEqual({ delta_tokens: {}, backfill: { root_index: 0, next_link: page2 } });
-    expect(batches[3].cursor).toEqual({ delta_tokens: { FA: 'TOK1' } });
+    expect(batches[2].cursor).toEqual({
+      delta_tokens: {},
+      scope_roots: ['FA'],
+      backfill: { root_index: 0, next_link: page2 },
+    });
+    expect(batches[3].cursor).toEqual({ delta_tokens: { FA: 'TOK1' }, scope_roots: ['FA'] });
   });
 
   it('backfill resume: intermediate chunks of a resumed page repeat the resume link', async () => {
@@ -242,13 +250,20 @@ describe('batch byte budget', () => {
       { batchByteBudget: 5 },
     );
     const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
-    const cursor: OneDriveCursor = { delta_tokens: {}, backfill: { root_index: 0, next_link: page2 } };
+    const cursor: OneDriveCursor = {
+      delta_tokens: {},
+      scope_roots: ['FA'],
+      backfill: { root_index: 0, next_link: page2 },
+    };
+    // :250's `expect(batches[0].cursor).toEqual(cursor)` needs NO edit — the
+    // resume cursor now matches the configured scope, so it rides through
+    // normalizeCursor untouched and the stamped copy equals it exactly.
 
     const batches = (await collect(source.pull(session, cursor))) as B[];
 
     expect(batches.map(ids)).toEqual([['f3', 'f4'], ['f5']]);
     expect(batches[0].cursor).toEqual(cursor);
-    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'TOK1' } });
+    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'TOK1' }, scope_roots: ['FA'] });
   });
 
   it('never splits a page when the budget is not reached (one batch per page, unchanged behaviour)', async () => {
@@ -270,6 +285,6 @@ describe('batch byte budget', () => {
     const batches = (await collect(source.pull(session, { delta_tokens: { FA: 'OLD' } }))) as B[];
 
     expect(batches.map(ids)).toEqual([['f1', 'f2']]);
-    expect(batches[0].cursor).toEqual({ delta_tokens: { FA: 'NEW' } });
+    expect(batches[0].cursor).toEqual({ delta_tokens: { FA: 'NEW' }, scope_roots: ['FA'] });
   });
 });

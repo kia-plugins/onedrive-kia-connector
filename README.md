@@ -40,15 +40,32 @@ You can connect multiple Microsoft accounts side by side.
 The picker writes the account config as
 
 ```json
-{ "roots": [ { "rootFolderId": "<OneDrive item id>", "rootName": "<name>" } ] }
+{ "folderRoots": [ { "id": "<OneDrive item id>", "name": "<name>" } ] }
 ```
 
 with one entry per selected folder (`"root"` is Graph's alias for the whole
-OneDrive). Duplicate root ids are ignored (first entry wins). If a hand-edited
-config ends up with one tracked root nested inside another, the overlapping
-item is still only indexed once (attributed to whichever root's walk reaches
-it first) — in the normal case the picker itself never lets you select a
-folder that overlaps an already-picked one.
+OneDrive). The pre-folder-scope shape
+`{ "roots": [ { "rootFolderId": …, "rootName": … } ] }` is still READ as a
+fallback while the app writes both for one release train; `folderRoots`
+always wins and the two are never merged. The app owns that second copy —
+this connector never writes or removes it.
+
+Duplicate root ids are ignored (first entry wins), and root ORDER is
+significant — it decides which root a file reachable from two of them is
+attributed to. If a hand-edited config ends up with one tracked root nested
+inside another, the overlapping item is still only indexed once (attributed
+to whichever root's walk reaches it first) — in the normal case the picker
+itself never lets you select a folder that overlaps an already-picked one.
+
+Editing the selection later ("Manage folders") never re-authenticates. It
+prunes the delta token of every de-selected root, clears any in-progress
+backfill position, and reports which roots' documents genuinely left scope.
+A de-selected folder that still sits inside a folder you kept removes
+nothing: the kept folder's delta token is dropped instead, so its next sync
+re-walks the shared region. That re-walk re-reads folder listings, not file
+contents, for everything still indexed; only documents this edit actually
+removed are downloaded again, and only if a folder you kept turns out to
+contain them after all.
 
 ## What gets indexed
 

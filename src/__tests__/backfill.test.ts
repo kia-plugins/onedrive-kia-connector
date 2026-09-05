@@ -56,9 +56,10 @@ describe('backfill', () => {
     expect(calls[0]).toBe(start);
     expect(batches[0].cursor).toEqual({
       delta_tokens: {},
+      scope_roots: ['FA'],
       backfill: { root_index: 0, next_link: page2 },
     });
-    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'TOK1' } });
+    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'TOK1' }, scope_roots: ['FA'] });
     expect(ids(batches[0])).toEqual(['f1']);
     expect(ids(batches[1])).toEqual(['f2']);
     expect(batches[0].items[0]).toMatchObject({
@@ -83,12 +84,19 @@ describe('backfill', () => {
     });
     const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
 
-    const cursor: OneDriveCursor = { delta_tokens: {}, backfill: { root_index: 0, next_link: page2 } };
+    // A resume cursor now carries the scope it was built for; without it
+    // normalizeCursor treats the whole cursor as stale and drops the
+    // resume link (covered by folder-scope.test.ts).
+    const cursor: OneDriveCursor = {
+      delta_tokens: {},
+      scope_roots: ['FA'],
+      backfill: { root_index: 0, next_link: page2 },
+    };
     const batches = (await collect(source.pull(session, cursor))) as B[];
 
     expect(calls[0]).toBe(page2);
     expect(calls.some((u) => u === deltaUrl('FA'))).toBe(false);
-    expect(batches[batches.length - 1].cursor).toEqual({ delta_tokens: { FA: 'TOK1' } });
+    expect(batches[batches.length - 1].cursor).toEqual({ delta_tokens: { FA: 'TOK1' }, scope_roots: ['FA'] });
   });
 
   it('multi-root: phase stays backfill until the LAST root reaches its deltaLink', async () => {
@@ -120,8 +128,15 @@ describe('backfill', () => {
     const batches = (await collect(source.pull(session, null))) as B[];
 
     expect(batches.map((b) => b.phase)).toEqual(['backfill', 'live']);
-    expect(batches[0].cursor).toEqual({ delta_tokens: { FA: 'TOK_A' }, backfill: { root_index: 1 } });
-    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'TOK_A', FB: 'TOK_B' } });
+    expect(batches[0].cursor).toEqual({
+      delta_tokens: { FA: 'TOK_A' },
+      scope_roots: ['FA', 'FB'],
+      backfill: { root_index: 1 },
+    });
+    expect(batches[1].cursor).toEqual({
+      delta_tokens: { FA: 'TOK_A', FB: 'TOK_B' },
+      scope_roots: ['FA', 'FB'],
+    });
     expect(ids(batches[0])).toEqual(['a1']);
     expect(ids(batches[1])).toEqual(['b1']);
   });

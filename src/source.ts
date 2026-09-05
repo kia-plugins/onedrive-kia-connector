@@ -79,6 +79,7 @@
  *    page in flight (idempotent via hash-skip).
  */
 import type {
+  Account,
   AuthChannel,
   Batch,
   Credentials,
@@ -86,12 +87,15 @@ import type {
   DocumentInput,
   ExternalRef,
   FileIgnoreReason,
+  FolderScopeUpdate,
+  FolderScopedConfig,
+  FolderSelectionChannel,
   HostFor,
   Query,
   Session,
   Source,
 } from '@kiagent/connector-sdk';
-import { MAX_CLOUD_BINARY_BYTES } from '@kiagent/connector-sdk';
+import { MAX_CLOUD_BINARY_BYTES, SourcePermanentError } from '@kiagent/connector-sdk';
 import {
   GRAPH_BASE,
   GraphApiError,
@@ -146,6 +150,15 @@ export interface RootConfig {
 
 export interface OneDriveCursor {
   delta_tokens: Record<string, string>;
+  /** The configured root ids this cursor's coverage was built for. ABSENT on
+   *  every cursor written before folder scope existed — core's v3 migration
+   *  deliberately leaves `Account.cursor` untouched — which
+   *  `normalizeCursor` treats as a mismatch. Deliberately NOT derived from
+   *  `delta_tokens` keys: nothing in this connector ever deletes a key
+   *  (`backfill()` and `delta()` both seed from a spread of the incoming
+   *  map), so those keys are a SUPERSET of the configured roots and would
+   *  claim coverage of roots that are long gone (spec-reality-diff A5a). */
+  scope_roots?: string[];
   /** Present only while establishing a root (initial backfill, or a root
    *  added after the account went live) for the first time. */
   backfill?: { root_index: number; next_link?: string };
@@ -164,7 +177,15 @@ export interface DriveItem {
   file?: { mimeType?: string };
   folder?: { childCount?: number };
   deleted?: { state: string };
-  parentReference?: { driveId?: string; path?: string; parentId?: string };
+  /** `id` is the parent ITEM's id — what C-50's ancestor walk climbs. Graph
+   *  returns it on every child; the pre-C-50 shape never read it, so it was
+   *  never declared here and only `expandIdsFor`'s local type had it. */
+  parentReference?: {
+    driveId?: string;
+    id?: string;
+    path?: string;
+    parentId?: string;
+  };
   '@microsoft.graph.downloadUrl'?: string;
 }
 
@@ -190,14 +211,44 @@ interface GraphDeltaPage {
 
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
-/** Normalize account config to the tracked roots. Deduped by rootFolderId —
- *  first entry wins. Falls back to the OneDrive root when the picker somehow
- *  stored nothing (defensive only — `connect()` always rejects an empty
- *  selection, so this path is not expected to run in practice). */
+/** Graph's alias for the caller's own drive root — the "whole OneDrive"
+ *  catch-all. This ONE literal is the id the My-files picker root carries in
+ *  both `connect()` and `manageFolders`, the id `rootsConfig` falls back to,
+ *  and the id `resolveRootLocation` short-circuits. It is also the id core's
+ *  v3 migration must treat as OneDrive's catch-all (DECISIONS R6): a live row
+ *  whose `metadata.root_folder_id` matches no other selected root is
+ *  attributed to THIS id instead of being archived. Core cannot import it
+ *  (different package), so a test pins the literal on this side. */
+export const ONEDRIVE_DRIVE_ROOT_ID = 'root';
+
+/** Normalize account config to the tracked roots.
+ *
+ *  Reads the CANONICAL `folderRoots: [{id, name}]` written by `connect()`,
+ *  `manageFolders` and core's v3 migration. The legacy
+ *  `roots: [{rootFolderId, rootName}]` shape is a read-only FALLBACK, used
+ *  only when `folderRoots` is absent or yields nothing usable: the R1 mirror
+ *  runs the other way (core writes `roots` alongside `folderRoots` for one
+ *  release train so the *installed* 2.0.5 build keeps working), so canonical
+ *  always wins and the two shapes are never merged.
+ *
+ *  Deduped by id — first entry wins. Falls back to the whole OneDrive when
+ *  neither key holds anything usable (defensive only — `connect()` and
+ *  `manageFolders` both reject an empty selection). Order is SEMANTIC: it
+ *  drives `backfill()`'s `root_index` and the first-root-wins attribution. */
 export function rootsConfig(session: Session): RootConfig[] {
-  const cfg = session.account.config as { roots?: unknown };
+  const cfg = session.account.config as { folderRoots?: unknown; roots?: unknown };
   const parsed: RootConfig[] = [];
-  if (Array.isArray(cfg.roots)) {
+  if (Array.isArray(cfg.folderRoots)) {
+    for (const raw of cfg.folderRoots) {
+      const r = raw as { id?: unknown; name?: unknown } | null;
+      if (r && typeof r.id === 'string' && r.id) {
+        const name = typeof r.name === 'string' && r.name ? r.name : r.id;
+        parsed.push({ rootFolderId: r.id, rootName: name });
+      }
+    }
+  }
+  // TODO(folder-scope-train-2): drop the legacy `roots` fallback (R1).
+  if (parsed.length === 0 && Array.isArray(cfg.roots)) {
     for (const raw of cfg.roots) {
       const r = raw as { rootFolderId?: unknown; rootName?: unknown } | null;
       if (r && typeof r.rootFolderId === 'string' && r.rootFolderId) {
@@ -208,7 +259,7 @@ export function rootsConfig(session: Session): RootConfig[] {
     }
   }
   if (parsed.length === 0) {
-    parsed.push({ rootFolderId: 'root', rootName: 'OneDrive' });
+    parsed.push({ rootFolderId: ONEDRIVE_DRIVE_ROOT_ID, rootName: 'OneDrive' });
   }
   const seen = new Set<string>();
   const deduped: RootConfig[] = [];
@@ -566,6 +617,49 @@ async function* walkRootToDeltaLink(
   }
 }
 
+/** Order-independent set equality on root ids: a merely REORDERED root list
+ *  must never force a re-walk. `undefined` (a pre-folder-scope cursor) is
+ *  always a mismatch. */
+function sameScope(a: string[] | undefined, b: string[]): boolean {
+  if (!a || a.length !== b.length) return false;
+  const seen = new Set(a);
+  return b.every((id) => seen.has(id));
+}
+
+/**
+ * Reconcile an incoming cursor with the CURRENT configured roots before any
+ * walking happens. On a match the cursor rides through untouched (a
+ * mid-backfill resume keeps its `next_link`). On a mismatch — a scope change
+ * that did not come through `manageFolders`, or any cursor written before
+ * `scope_roots` existed — it is rebuilt:
+ *
+ *  - `delta_tokens` is PRUNED to the configured roots. This is the only
+ *    place, besides `manageFolders`, where a token key is ever removed.
+ *  - the `backfill` key is DELETED OUTRIGHT, never reset to
+ *    `{root_index: 0}`: `root_index` is a position in the roots array and
+ *    `next_link` is one specific root's opaque page URL, so a stale pair
+ *    resumes paging the WRONG root's result set (spec-reality-diff A5c). A
+ *    root that loses its resume link simply re-enumerates its pages from the
+ *    start — bounded, and idempotent via `hashSkip`.
+ *  - a configured root left with no token is then established by
+ *    `backfill()` on this very pull, because `backfillDone` sees it lacking
+ *    one. Established roots keep polling; nothing is re-downloaded.
+ */
+export function normalizeCursor(
+  cursor: OneDriveCursor | null,
+  roots: RootConfig[],
+): OneDriveCursor | null {
+  if (!cursor) return null;
+  const configured = roots.map((r) => r.rootFolderId);
+  if (sameScope(cursor.scope_roots, configured)) return cursor;
+  const delta_tokens: Record<string, string> = {};
+  for (const id of configured) {
+    const token = cursor.delta_tokens?.[id];
+    if (typeof token === 'string') delta_tokens[id] = token;
+  }
+  return { delta_tokens, scope_roots: configured };
+}
+
 function backfillDone(cursor: OneDriveCursor | null, roots: RootConfig[]): boolean {
   if (!cursor) return roots.length === 0;
   if (cursor.backfill) return false;
@@ -746,6 +840,209 @@ async function* delta(
   deps.ignored.logIfAny(session);
 }
 
+/** Where a tracked root sits, for containment comparison. `drive` is the
+ *  literal `'me'` for the caller's own OneDrive — Graph spells those item
+ *  paths `/drive/root:` — and the remote drive id for a "Shared with me"
+ *  root that reports `/drives/{id}/root:`. The PATH FORM, not
+ *  `parentReference.driveId`, is the discriminator, because the drive-root
+ *  catch-all is answered without an item lookup at all and therefore has no
+ *  `parentReference` to read. `path` is the folder's absolute path inside
+ *  that drive with a LEADING and TRAILING slash, so `startsWith` compares
+ *  whole segments (`/Alpha/` never prefixes `/AlphaBeta/`). */
+export interface RootLocation {
+  drive: string;
+  path: string;
+}
+
+const MY_DRIVE = 'me';
+
+/**
+ * Resolve one tracked root to a comparable location, or `null` when it is
+ * INCOMPARABLE — it can neither cover nor be covered by anything.
+ *
+ * `null` is returned for exactly two cases, both of which make archiving the
+ * correct answer: a "Shared with me" root whose `parentReference.path` is
+ * absent or relative to a drive this connector never resolves (the same
+ * limitation `buildDisplayPath` documents in path-resolver.ts), and a root
+ * that is gone upstream (404/410).
+ *
+ * ANY OTHER failure RETHROWS, aborting the whole save — including a malformed
+ * percent-escape out of `decodeURIComponent`, which is deliberately not
+ * caught. With no `reconcile()` in this connector, guessing "incomparable" on
+ * a transient Graph 5xx would archive a root that a retained ancestor
+ * actually covers, and nothing would ever restore it: the covering root keeps
+ * its delta token, and `hashSkip` never re-emits a LIVE row. A failed save is
+ * recoverable by clicking Save again; a wrong one is not.
+ *
+ * Note the client retries a 5xx four times before throwing
+ * (`client.ts:91-93`, `:156-165`), while a 404 throws on the first response.
+ */
+export async function resolveRootLocation(
+  client: GraphClient,
+  rootFolderId: string,
+): Promise<RootLocation | null> {
+  if (rootFolderId === ONEDRIVE_DRIVE_ROOT_ID) return { drive: MY_DRIVE, path: '/' };
+  type RootItem = { name?: string; parentReference?: { driveId?: string; path?: string } };
+  let item: RootItem;
+  try {
+    item = await client.request<RootItem>(
+      `${GRAPH_BASE}/me/drive/items/${encodeURIComponent(rootFolderId)}?$select=id,name,parentReference`,
+    );
+  } catch (e) {
+    if (e instanceof GraphApiError && (e.status === 404 || e.status === 410)) return null;
+    throw e;
+  }
+  const raw = item.parentReference?.path;
+  const name = item.name;
+  if (!raw || !name) return null;
+  const mine = /^\/drive\/root:?/.exec(raw);
+  const foreign = /^\/drives\/([^/]+)\/root:?/.exec(raw);
+  let drive: string;
+  let parent: string;
+  if (mine) {
+    drive = MY_DRIVE;
+    parent = raw.slice(mine[0].length);
+  } else if (foreign) {
+    drive = foreign[1];
+    parent = raw.slice(foreign[0].length);
+  } else {
+    return null; // an unknown/relative path form — incomparable
+  }
+  // Graph percent-encodes path SEGMENTS but returns `name` raw, so the parent
+  // must be decoded before the two are joined or `/My%20Docs` would never
+  // prefix `/My Docs/`.
+  return { drive, path: `${decodeURIComponent(parent)}/${name}/`.replace(/\/+/g, '/') };
+}
+
+/** Ancestor-walk backstop. A OneDrive tree cannot be this deep; the loop's
+ *  real exit is reaching the drive root or a foreign drive. */
+const MAX_EXPAND_HOPS = 64;
+
+/**
+ * C-50 — the ANCESTOR ids of the account's current roots, for
+ * `FolderPickerSpec.expand`, so Manage folders opens REVEALED down to each
+ * tracked folder instead of collapsed behind one "OneDrive" row.
+ *
+ * The renderer cannot derive this: a Graph item id is opaque to it and the
+ * picker's tree paths are synthetic. Only the source can walk
+ * `parentReference`, so the source ships the answer and the modal matches it
+ * by equality against the ids `listChildFolders` returns.
+ *
+ * This walks parent IDS, not the `{drive, path}` locations
+ * `resolveRootLocation` builds: the picker addresses rows by item id, and a
+ * path cannot be matched against a listing without one Graph GET per segment
+ * anyway. Three terminations:
+ *  - the parent IS the drive root (`/drive/root:` with nothing after it) →
+ *    emit `ONEDRIVE_DRIVE_ROOT_ID`, which is the literal id the "My files"
+ *    tab lists, exactly as google-docs maps its chain end to `'root'`;
+ *  - a `/drives/{id}/root:` path → the chain has left into a shared drive,
+ *    whose ancestors the picker never lists (the "Shared with me" tab shows
+ *    those roots directly), so stop without emitting;
+ *  - anything unreadable or malformed → stop.
+ *
+ * Failure policy is the OPPOSITE of `resolveRootLocation`, deliberately, and
+ * for the same reason google-docs' `expandIdsFor` swallows: that function
+ * decides what gets ARCHIVED and must abort a save rather than guess, while
+ * this one is cosmetic and runs BEFORE the modal opens. Removing a root that
+ * vanished upstream is the main reason to open Manage folders, so a reveal
+ * must never be able to keep the user out of the editor.
+ */
+export async function expandIdsFor(
+  client: GraphClient,
+  selected: readonly { id: string; name: string }[],
+): Promise<string[]> {
+  type Ref = {
+    id?: string;
+    name?: string;
+    parentReference?: { driveId?: string; id?: string; path?: string };
+  };
+  const out = new Set<string>();
+  const cache = new Map<string, Ref | null>();
+  const get = async (id: string): Promise<Ref | null> => {
+    const hit = cache.get(id);
+    if (hit !== undefined) return hit;
+    let item: Ref | null;
+    try {
+      item = await client.request<Ref>(
+        `${GRAPH_BASE}/me/drive/items/${encodeURIComponent(id)}?$select=id,name,parentReference`,
+      );
+    } catch {
+      item = null;
+    }
+    cache.set(id, item);
+    return item;
+  };
+
+  for (const sel of selected) {
+    if (sel.id === ONEDRIVE_DRIVE_ROOT_ID) continue; // the catch-all IS a root row
+    let current = sel.id;
+    const visited = new Set<string>([current]);
+    for (let hops = 0; hops < MAX_EXPAND_HOPS; hops++) {
+      const ref = (await get(current))?.parentReference;
+      const raw = ref?.path;
+      if (!raw) break;
+      const mine = /^\/drive\/root:?/.exec(raw);
+      if (!mine) break; // a shared/foreign drive — its ancestors are never listed
+      if (raw.slice(mine[0].length).replace(/\/+$/, '') === '') {
+        out.add(ONEDRIVE_DRIVE_ROOT_ID);
+        break;
+      }
+      const parentId = ref?.id;
+      if (!parentId || visited.has(parentId)) break; // unknown parent, or a cycle
+      visited.add(parentId);
+      out.add(parentId);
+      current = parentId;
+    }
+  }
+  return [...out];
+}
+
+/**
+ * `p` is `root` itself or lives anywhere under it, respecting the separator
+ * BOUNDARY: `/Docs` does not contain `/DocsBackup`. Same shape as core's
+ * `@shared/folder-paths.ts:isUnder`, which is where this belongs
+ * conceptually — it is duplicated rather than imported because a connector
+ * is a standalone bundle with no access to core's internals.
+ *
+ * C-46/D4: `covers`/`overlaps` used a bare `startsWith`, so a removed sibling
+ * whose NAME EXTENDS a retained root read as contained and was silently
+ * exempted from archival. Measured reach of that defect through
+ * `manageFolders` TODAY: none — every path `resolveRootLocation` builds
+ * already ends in `/` (it appends one, and the drive root is the literal
+ * `'/'`), and `/DocsBackup/` does not `startsWith` `/Docs/`. The boundary
+ * check makes the predicates correct INDEPENDENT of that undocumented
+ * convention instead of resting on it, which is the point: nothing in the
+ * types says a `RootLocation.path` is slash-terminated, and both predicates
+ * are exported.
+ *
+ * Single separator only (`/`): these are Graph paths, never OS paths, so
+ * core's extra `\\` handling has nothing to match here.
+ */
+const isUnderPath = (p: string, root: string): boolean => {
+  if (p === root) return true;
+  if (!p.startsWith(root)) return false;
+  return root.endsWith('/') || p.charAt(root.length) === '/';
+};
+
+/** `retained` is an ancestor-or-self of `removed`: NOTHING under the removed
+ *  root leaves scope, so it must not be archived (DECISIONS R8). Exported for
+ *  the C-46/D4 boundary unit tests, which are the only way to exercise a
+ *  non-slash-terminated path. */
+export const covers = (retained: RootLocation | null, removed: RootLocation | null): boolean =>
+  retained !== null &&
+  removed !== null &&
+  retained.drive === removed.drive &&
+  isUnderPath(removed.path, retained.path);
+
+/** The two roots share a subtree in EITHER direction — the precondition for
+ *  first-root-wins attribution to have named the wrong root. Boundary-aware
+ *  for the same reason as `covers` (C-46/D4). */
+export const overlaps = (a: RootLocation | null, b: RootLocation | null): boolean =>
+  a !== null &&
+  b !== null &&
+  a.drive === b.drive &&
+  (isUnderPath(a.path, b.path) || isUnderPath(b.path, a.path));
+
 export interface OneDriveTestSeams extends Partial<Pick<GraphClientDeps, 'sleep' | 'random'>> {
   batchByteBudget?: number;
   batchItemLimit?: number;
@@ -778,6 +1075,10 @@ export function createOneDriveSource(
       auth: 'oauth',
       multiAccount: true,
       cadence: { every: '15m' },
+      /** Scoped to a user-selected set of folder roots: enables the Tracked
+       *  folders card and `accounts:start-manage-folders`. A descriptor with
+       *  this flag MUST implement `manageFolders` — it does, below. */
+      folderScope: true,
     },
 
     async connect(auth: AuthChannel) {
@@ -802,20 +1103,14 @@ export function createOneDriveSource(
         throw new Error('onedrive: Graph /me response missing mail and userPrincipalName');
       }
 
-      // Reconnect after an auth failure restores the stored selection: the
-      // picker opens BLANK (no preselection), so re-asking here invites a
-      // careless confirm that silently shrinks the corpus. The config rides
-      // back VERBATIM. A healthy re-connect still runs the picker: it is the
-      // only way to change the selection; the engine upserts on
-      // (source, identifier) either way, so documents and cursor survive.
-      const prior = (await host.query.accounts()).find(
-        (a) => a.source === 'onedrive' && a.identifier === identifier && a.status === 'needsReauth',
-      );
-      if (prior) {
-        auth.status('Restoring previous folder selection…');
-        return { identifier, config: prior.config };
-      }
-
+      // No needsReauth lookup any more: re-auth is `reauthenticate(account,
+      // auth)`, which is handed the exact account and verifies the returned
+      // identity against it. The deleted heuristic matched on
+      // (source, identifier, status) with `.find()` — first match wins — so
+      // two accounts sharing an identifier were indistinguishable, and an
+      // account stored from `mail` never matched a `/me` that answered only
+      // `userPrincipalName`. `connect()` is now purely "add a NEW account".
+      //
       // The platform's shared folder-picker: lazy tree over the connect-time
       // client, multi-select with covering roots. A user cancel rejects —
       // let that propagate out of connect().
@@ -826,25 +1121,37 @@ export function createOneDriveSource(
         ],
         multiSelect: true,
         roots: async (mode) =>
-          mode === 'my-files' ? [{ id: 'root', name: 'OneDrive', hasChildren: true }] : listSharedRoots(client),
+          mode === 'my-files'
+            ? [{ id: ONEDRIVE_DRIVE_ROOT_ID, name: 'OneDrive', hasChildren: true }]
+            : listSharedRoots(client),
         children: (id) => listChildFolders(client, id),
         count: (id) => countChildren(client, id),
+        purpose: 'connect',
       });
       if (picked.length === 0) throw new Error('onedrive: no folders selected');
       return {
         identifier,
-        config: { roots: picked.map((n) => ({ rootFolderId: n.id, rootName: n.name })) },
+        config: { folderRoots: picked.map((n) => ({ id: n.id, name: n.name })) },
       };
     },
 
     async *pull(session: Session, cursor: OneDriveCursor | null) {
       const client = clientFor(session);
       const roots = rootsConfig(session);
+      const scopeRoots = roots.map((r) => r.rootFolderId);
+      const start = normalizeCursor(cursor, roots);
       const processed = new Set<string>();
-      if (!backfillDone(cursor, roots)) {
-        yield* backfill(client, session, host.query, host.net.fetch, cursor, roots, processed, budget);
-      } else {
-        yield* delta(client, session, host.query, host.net.fetch, cursor!, roots, processed, budget);
+      const walk = !backfillDone(start, roots)
+        ? backfill(client, session, host.query, host.net.fetch, start, roots, processed, budget)
+        : delta(client, session, host.query, host.net.fetch, start!, roots, processed, budget);
+      // ONE stamping site. There are SEVEN internal cursor literals across
+      // backfill()/establishRootLive()/pollRoot() (`src/source.ts:595`,
+      // `:621`, `:634`, `:635`, `:638`, `:666`, `:698`); stamping each of
+      // them would make a single missed site look like a permanent scope
+      // mismatch, i.e. a token prune on every pull forever. Stamping the
+      // yielded batch instead is impossible to get partially wrong.
+      for await (const batch of walk) {
+        yield { ...batch, cursor: { ...batch.cursor, scope_roots: scopeRoots } };
       }
     },
 
@@ -858,6 +1165,14 @@ export function createOneDriveSource(
         markdown: item.markdown,
         ...(item.bytes ? { binary: { bytes: item.bytes, mime, filename: f.name } } : {}),
         url: f.webUrl ?? 'https://onedrive.live.com/',
+        /** Folder scope: the tracked root whose delta feed emitted this item
+         *  (first-root-wins under overlap — `deps.processed`, `:463-468`).
+         *  ALWAYS set: every walk carries its `RootConfig` down to
+         *  `buildItem`/`failedItem`, so this connector never reaches the
+         *  engine's NULL-and-warn path (DECISIONS R5). `metadata.
+         *  root_folder_id` below is kept as-is — core's v3 migration reads
+         *  that spelling to backfill `scope_root_id` on existing rows. */
+        scopeRootId: item.rootFolderId,
         metadata: {
           drive_item_id: f.id,
           drive_id: f.parentReference?.driveId ?? '',
@@ -907,6 +1222,252 @@ export function createOneDriveSource(
           return null; // gone upstream — the next delta poll will archive it
         }
         throw e;
+      }
+    },
+
+    /**
+     * Edit this account's tracked roots using its EXISTING credentials. Never
+     * authenticates — `FolderSelectionChannel` has no `oauth` verb — and
+     * persists nothing: core's `applyFolderScope` writes config, cursor and
+     * archival in ONE transaction.
+     *
+     * The Graph client is `clientFor(session)`, which calls
+     * `session.credentials()` fresh per attempt. `connect()`'s client closes
+     * over a FROZEN access token and would die on a long-open picker
+     * (spec-reality-diff D9); do not copy that wiring here.
+     */
+    async manageFolders(
+      session: Session,
+      channel: FolderSelectionChannel,
+    ): Promise<FolderScopeUpdate<OneDriveCursor>> {
+      const client = clientFor(session);
+      const prior = rootsConfig(session);
+      const priorIds = new Set(prior.map((r) => r.rootFolderId));
+
+      channel.status('Loading your OneDrive folders…');
+      const selectedNodes = prior.map((r) => ({
+        id: r.rootFolderId,
+        name: r.rootName,
+        hasChildren: true,
+      }));
+      const picked = await channel.pickFolders({
+        modes: [
+          { key: 'my-files', label: 'My files' },
+          { key: 'shared', label: 'Shared with me' },
+        ],
+        multiSelect: true,
+        roots: async (mode) =>
+          mode === 'my-files'
+            ? [{ id: ONEDRIVE_DRIVE_ROOT_ID, name: 'OneDrive', hasChildren: true }]
+            : listSharedRoots(client),
+        children: (id) => listChildFolders(client, id),
+        count: (id) => countChildren(client, id),
+        // The complete current covering set, pre-checked AND removable.
+        selected: selectedNodes,
+        // C-50: open revealed down to the tracked folders. Walked before the
+        // modal renders, so `status` above is what the user sees meanwhile.
+        expand: await expandIdsFor(client, selectedNodes),
+        purpose: 'manage',
+      });
+      if (picked.length === 0) throw new Error('onedrive: no folders selected');
+
+      // Root ORDER is semantic — it drives backfill()'s root_index and the
+      // first-root-wins attribution — and the picker's return order is not
+      // stable. Keep retained roots in their prior config order; append what
+      // is new.
+      const byId = new Map(picked.map((n) => [n.id, n]));
+      const ordered = [
+        ...prior.filter((r) => byId.has(r.rootFolderId)).map((r) => byId.get(r.rootFolderId)!),
+        ...picked.filter((n) => !priorIds.has(n.id)),
+      ];
+      const nextIds = ordered.map((n) => n.id);
+      const removed = prior.filter((r) => !byId.has(r.rootFolderId));
+      const retained = prior.filter((r) => byId.has(r.rootFolderId));
+
+      const archiveScopeRootIds: string[] = [];
+      const reattributeScopeRoots: Array<{ from: string; to: string }> = [];
+      const dropTokens = new Set<string>();
+      if (removed.length > 0) {
+        channel.status('Checking which folders are still covered…');
+        const where = new Map<string, RootLocation | null>();
+        // C-46 addendum: coverage is decided against the NEW selection, not
+        // against `retained` (the roots that survive from the PRIOR config).
+        // A coverer the user ADDS in the same save — de-selecting `/Beta` in
+        // favour of the drive root, the widening edit D5 exists to make cheap
+        // — is in `picked` but never in `retained`, so keying on `retained`
+        // sent it to `archiveScopeRootIds` and re-downloaded the whole subtree.
+        // Measured before this fix: prior [/Beta] + picked [root] produced
+        // archive ["FB"], reattribute []. `ordered` is the new set in config
+        // order, so the first-match-wins tie-break is unchanged.
+        for (const id of [
+          ...removed.map((r) => r.rootFolderId),
+          ...nextIds,
+        ]) {
+          where.set(id, await resolveRootLocation(client, id));
+        }
+        for (const r of removed) {
+          const loc = where.get(r.rootFolderId) ?? null;
+          let coveredBy: string | null = null;
+          for (const k of ordered) {
+            const kloc = where.get(k.id) ?? null;
+            // A retained ANCESTOR still contains the removed root's whole
+            // subtree, so nothing leaves scope and archiving would be wrong
+            // (DECISIONS R8). The FIRST such root in config order wins, which
+            // is the same tie-break `deps.processed` uses when two roots both
+            // contain a file.
+            if (coveredBy === null && covers(kloc, loc)) coveredBy = k.id;
+            // Overlap in EITHER direction means first-root-wins attribution
+            // (a config-ORDER artifact, `deps.processed`, `:463-468`) may
+            // have stamped documents in the shared region with the wrong
+            // root's id. Drop the retained root's delta token so its next
+            // pull re-walks the region (spec-reality-diff A5b). Cost:
+            // `hashSkip` gates before any download, so every LIVE row in the
+            // shared region is re-read as metadata pages and never
+            // re-downloaded.
+            //
+            // ⚠️ C-46/D3 — THE RE-WALK DOES NOT RE-STAMP A LIVE ROW. An
+            // earlier draft of this comment claimed the token drop made
+            // attribution "self-heal"; it does not, and that false claim is
+            // what hid this defect. `hashSkip` (`src/source.ts:296`, gating
+            // inside `buildItem` at `:403`) returns `null` for an unchanged
+            // LIVE row BEFORE attribution is touched, so the re-walk emits
+            // nothing for it and `scope_root_id` keeps whatever the first
+            // pull wrote. Measured, not argued (C-46 addendum #6). The token
+            // drop still earns its keep — it re-walks the shared region, and
+            // rows this save ARCHIVES are re-emitted (hence un-archived,
+            // since `hashSkip` returns false for an archived row) at the cost
+            // of a re-download. What it cannot do is move a live row's stamp.
+            // `reattributeScopeRoots` below is what closes that gap.
+            if (overlaps(kloc, loc) && priorIds.has(k.id)) dropTokens.add(k.id);
+          }
+          // C-46/D3+D5, the third verb. A covered root must NOT be silently
+          // skipped: its live rows stay stamped with the REMOVED id, and a
+          // later save that removes the COVERING root archives by an `IN`-list
+          // over `scope_root_id` — which those rows no longer match. They
+          // would then be live, outside the selection, forever; this connector
+          // has no `reconcile()` to notice. Re-attribution re-stamps them onto
+          // the covering root inside core's same transaction: one UPDATE, no
+          // network, no re-download, no searchability gap.
+          //
+          // The two lists are DISJOINT by construction — every removed root
+          // takes exactly one branch — and core THROWS if they ever overlap.
+          if (coveredBy === null) archiveScopeRootIds.push(r.rootFolderId);
+          else reattributeScopeRoots.push({ from: r.rootFolderId, to: coveredBy });
+        }
+      }
+
+      const prev = (session.account.cursor ?? null) as OneDriveCursor | null;
+      const delta_tokens: Record<string, string> = {};
+      for (const id of nextIds) {
+        if (dropTokens.has(id)) continue;
+        const token = prev?.delta_tokens?.[id];
+        if (typeof token === 'string') delta_tokens[id] = token;
+      }
+      // Pruned to the configured set in this SAME write — the append-only
+      // `delta_tokens` leak is closed here and in `normalizeCursor`, nowhere
+      // else. NO `backfill` key, ever: a stale root_index/next_link pair
+      // would resume paging the wrong root (A5c).
+      const cursor: OneDriveCursor = { delta_tokens, scope_roots: [...nextIds] };
+
+      // A-3 / R5. `archiveNullScoped` asks core to archive this account's live
+      // rows whose `scope_root_id` is NULL — rows core's v3 migration could
+      // not attribute (a mass-archive refusal, unreadable metadata). This
+      // connector cannot SEE them: `Query` offers `byExternalId`, `document`,
+      // `children`, `search`, `count` and `countBy({field:'from'|'label'})`,
+      // none of them keyed on scope. So the flag is derived from the CURSOR
+      // WE RETURN rather than from row evidence, and the derivation IS A-3's
+      // pairing condition stated as an invariant: request the repair exactly
+      // when this cursor re-establishes EVERY configured root from scratch —
+      // no delta token survives, and this branch never writes a `backfill`
+      // key. Under that condition the very next pull re-walks every root and,
+      // because `hashSkip` does not skip an archived row, re-emits (hence
+      // un-archives) every NULL row still genuinely in scope. Archiving NULL
+      // rows WITHOUT that re-walk is permanent loss — `contentHash` excludes
+      // scope and this connector hashSkips — which is exactly what A-3
+      // forbids.
+      const archiveNullScoped = Object.keys(delta_tokens).length === 0;
+      // ⚠️ C-34 — CORE DECLINES TO ACT ON THIS FLAG IN THIS TRAIN, BY
+      // DESIGN. Keep computing and emitting it: it is part of the frozen
+      // `FolderScopeUpdate` and it is how a source states intent. But expect
+      // NO effect — Task 3 drops `archiveNullScoped` from
+      // `applyFolderScope`'s store input type and Task 7 does not forward it
+      // (it warns that a source asked and was refused). Do NOT "fix" this
+      // connector when you discover the field has no effect, and do not
+      // delete the derivation: it is the invariant a later, safe repair path
+      // would key on.
+      //
+      // Why core refuses the pairing argued for above: the archive would land
+      // BEFORE there is any proof the re-establishing walk actually LISTED
+      // the row. An archived row IS re-emitted (hashSkip's
+      // `if (!existing || existing.archivedAt) return false;` at
+      // `src/source.ts:296`) — but only for rows the walk reaches, and a LIVE
+      // NULL-scoped row has no other re-stamp path, because core's
+      // upsertDocument early-returns on `content_hash === hash &&
+      // archived_at === null` (kiagent-core write-tx.ts:170-176). Anything
+      // the walk misses stays archived for good, and this connector has NO
+      // `reconcile()` (`src/source.ts:62`) — no later pass ever notices. On a
+      // `needsReauth` account the walk does not even start (core
+      // boot.ts:194-202: 'needsReauth' is a RESTING state; only the user's
+      // explicit Retry or a fresh connect restarts the loop). What would have
+      // to exist before core could honour the flag is an archive-AFTER-proof
+      // predicate shaped like core's `reconcile` (write-tx.ts:512-538:
+      // `seq <= ?` AND `NOT EXISTS (… reconcile_listing …)`), plus the
+      // listing pass this connector does not have — not a boolean.
+
+      // A-2: the legacy R1 `roots` mirror is CORE's to write (in the v3
+      // migration and in applyFolderScope) and core's alone. This connector
+      // neither writes nor strips it — any existing `roots` key rides through
+      // untouched and core overwrites it, derived from `folderRoots`, inside
+      // the same transaction. Stripping it here is what left the installed,
+      // non-auto-updating 2.0.5 build with no `roots` at all after the first
+      // Save, which is precisely the failure R1 exists to prevent.
+      const config: Record<string, unknown> & FolderScopedConfig = {
+        ...session.account.config,
+        folderRoots: ordered.map((n) => ({ id: n.id, name: n.name })),
+      };
+
+      return { config, cursor, archiveScopeRootIds, reattributeScopeRoots, archiveNullScoped };
+    },
+
+    /**
+     * Re-authenticate THIS account. Returns nothing: reconnect never changes
+     * scope, and config/cursor are untouched.
+     *
+     * Identity is verified against BOTH Graph identity fields, trimmed and
+     * case-folded. `/me` may answer with `mail` on one sign-in and only
+     * `userPrincipalName` on the next; that is the same person, not a
+     * mismatch. A genuine mismatch is a SourcePermanentError — retrying the
+     * same wrong Microsoft account can never help, and silently repointing
+     * an account at a different identity is how a corpus gets mixed.
+     */
+    async reauthenticate(account: Account, auth: AuthChannel): Promise<void> {
+      auth.status('Waiting for Microsoft sign-in…');
+      const creds: Credentials = await auth.oauth(FILES_SCOPES);
+      const accessToken = creds.accessToken;
+      if (!accessToken) {
+        throw new Error('onedrive: Microsoft sign-in returned no access token');
+      }
+      const client = new GraphClient({
+        fetch: host.net.fetch,
+        getToken: async () => accessToken,
+        ...clock,
+      });
+
+      auth.status('Fetching Microsoft profile…');
+      const me = await client.request<{ mail?: string; userPrincipalName?: string }>(
+        `${GRAPH_BASE}/me?$select=mail,userPrincipalName,id`,
+      );
+      const identities = [me.mail, me.userPrincipalName].filter(
+        (v): v is string => typeof v === 'string' && v.trim() !== '',
+      );
+      if (identities.length === 0) {
+        throw new Error('onedrive: Graph /me response missing mail and userPrincipalName');
+      }
+      const want = account.identifier.trim().toLowerCase();
+      if (!identities.some((v) => v.trim().toLowerCase() === want)) {
+        throw new SourcePermanentError(
+          `onedrive: signed in as ${identities[0]}, but this account is ${account.identifier} — sign in with the original Microsoft account`,
+        );
       }
     },
   };

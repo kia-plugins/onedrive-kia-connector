@@ -49,7 +49,7 @@ describe('delta', () => {
     expect(batches).toHaveLength(1);
     expect(batches[0].phase).toBe('live');
     expect(ids(batches[0])).toEqual(['f1']);
-    expect(batches[0].cursor).toEqual({ delta_tokens: { FA: 'NEW_TOKEN' } });
+    expect(batches[0].cursor).toEqual({ delta_tokens: { FA: 'NEW_TOKEN' }, scope_roots: ['FA'] });
   });
 
   it('follows @odata.nextLink across poll pages and saves the final token', async () => {
@@ -75,7 +75,7 @@ describe('delta', () => {
 
     expect(batches).toHaveLength(2);
     expect(batches.flatMap(ids)).toEqual(['f1', 'f2']);
-    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'NEW_TOKEN' } });
+    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'NEW_TOKEN' }, scope_roots: ['FA'] });
   });
 
   it('deletes: a removed item with an existing doc is surfaced via Batch.deletions', async () => {
@@ -202,7 +202,7 @@ describe('delta', () => {
     const batches = (await collect(source.pull(session, cursor))) as B[];
 
     expect(calls).toEqual([staleUrl, repriming]);
-    expect(batches[batches.length - 1].cursor).toEqual({ delta_tokens: { FA: 'REPRIMED' } });
+    expect(batches[batches.length - 1].cursor).toEqual({ delta_tokens: { FA: 'REPRIMED' }, scope_roots: ['FA'] });
     expect(logs.some((l) => l.level === 'warn' && /token invalid for root FA/.test(l.msg))).toBe(true);
   });
 
@@ -249,6 +249,6 @@ describe('delta', () => {
 
     expect(batches.flatMap(ids)).toEqual(['b1']);
     const last = batches[batches.length - 1];
-    expect(last.cursor).toEqual({ delta_tokens: { FA: 'REPRIMED', FB: 'NEW_B' } });
+    expect(last.cursor).toEqual({ delta_tokens: { FA: 'REPRIMED', FB: 'NEW_B' }, scope_roots: ['FA', 'FB'] });
   });
 });
