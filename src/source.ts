@@ -177,7 +177,15 @@ export interface DriveItem {
   file?: { mimeType?: string };
   folder?: { childCount?: number };
   deleted?: { state: string };
-  parentReference?: { driveId?: string; path?: string; parentId?: string };
+  /** `id` is the parent ITEM's id — what C-50's ancestor walk climbs. Graph
+   *  returns it on every child; the pre-C-50 shape never read it, so it was
+   *  never declared here and only `expandIdsFor`'s local type had it. */
+  parentReference?: {
+    driveId?: string;
+    id?: string;
+    path?: string;
+    parentId?: string;
+  };
   '@microsoft.graph.downloadUrl'?: string;
 }
 
