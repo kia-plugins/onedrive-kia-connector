@@ -16,7 +16,12 @@ import {
   type OneDriveCursor,
   type OneDriveItem,
 } from '../source';
-import type { Batch, DocumentInput, FolderNode } from '@kiagent/connector-sdk';
+import type {
+  Batch,
+  DocumentInput,
+  FolderNode,
+  FolderScopeUpdate,
+} from '@kiagent/connector-sdk';
 import {
   collect,
   deltaUrl,
@@ -34,6 +39,56 @@ import {
 const fr = (...pairs: Array<[string, string]>) => pairs.map(([id, name]) => ({ id, name }));
 const node = (id: string, name: string): FolderNode => ({ id, name, hasChildren: true });
 
+/** One stored document as core holds it: an `externalId`, the `scope_root_id`
+ *  stamp the emitting pull left on it, and whether it is archived. */
+interface Row {
+  externalId: string;
+  scopeRootId: string;
+  archived: boolean;
+}
+const row = (externalId: string, scopeRootId: string): Row => ({
+  externalId,
+  scopeRootId,
+  archived: false,
+});
+
+/**
+ * A model of core's `applyFolderScope` write transaction, faithful to the
+ * `FolderScopeUpdate` contract: `reattributeScopeRoots` re-stamps
+ * `scope_root_id` from → to FIRST, then `archiveScopeRootIds` archives by an
+ * `IN`-list over the resulting stamps — one transaction — and a `from` that
+ * ALSO appears in `archiveScopeRootIds` THROWS rather than being silently
+ * ordered (contracts.ts, C-46/D5). The throw lives here so a contradictory
+ * emission fails a test instead of quietly working.
+ *
+ * The suites drive this instead of a second `pull()` between edits on
+ * purpose: C-46 addendum #6 MEASURED that a re-walk does not re-stamp a live
+ * row — `hashSkip` (`src/source.ts:296`, gating inside `buildItem` at `:403`)
+ * returns before attribution is refreshed — so re-attribution really is the
+ * only thing that can move a live row's stamp.
+ */
+function applyFolderScope(rows: Row[], out: FolderScopeUpdate<OneDriveCursor>): Row[] {
+  const archive = new Set(out.archiveScopeRootIds);
+  const reattribute = out.reattributeScopeRoots ?? [];
+  for (const { from } of reattribute) {
+    if (archive.has(from)) {
+      throw new Error(`applyFolderScope: '${from}' is in BOTH reattribute and archive`);
+    }
+  }
+  const moves = new Map(reattribute.map((m) => [m.from, m.to]));
+  return rows.map((r) => {
+    const scopeRootId = moves.get(r.scopeRootId) ?? r.scopeRootId;
+    return { ...r, scopeRootId, archived: r.archived || archive.has(scopeRootId) };
+  });
+}
+
+/** The documents this save was supposed to remove but left searchable: live,
+ *  yet stamped with a root the new selection no longer contains. */
+const liveOutsideScope = (rows: Row[], config: FolderScopeUpdate<OneDriveCursor>['config']) => {
+  const inScope = new Set((config.folderRoots as Array<{ id: string }>).map((r) => r.id));
+  return rows.filter((r) => !r.archived && !inScope.has(r.scopeRootId)).map((r) => r.externalId);
+};
+
 /** `/me/drive` item fixtures that `resolveRootLocation` reads for containment.
  *  FB = `/Beta/`, FBSUB = `/Beta/Sub/`, FG = `/Gamma/`, SH1 = a shared root
  *  with no `parentReference` at all, i.e. INCOMPARABLE. */
@@ -43,6 +98,9 @@ const worldItems: GraphWorld['items'] = {
     parentReference: { driveId: 'drive-1', path: '/drive/root:/Beta' },
   }),
   FG: driveFolder('FG', 'Gamma'),
+  // C-46/D4: a SIBLING of FB whose name EXTENDS it — `/BetaBackup/` beside
+  // `/Beta/`. Nothing under it is contained by FB.
+  FBB: driveFolder('FBB', 'BetaBackup'),
   SH1: { id: 'SH1', name: 'Shared specs', folder: { childCount: 1 } },
 };
 
@@ -330,6 +388,33 @@ describe('manageFolders', () => {
       roots: [{ rootFolderId: 'OLD', rootName: 'Stale mirror' }],
       folderRoots: fr(['FB', 'Beta']),
     });
+  });
+});
+
+describe('C-46/D4 — a name-extending SIBLING is not covered and its documents are archived', () => {
+  it('removing /BetaBackup while /Beta is retained archives it end to end', async () => {
+    const { source } = makeSource();
+    const { session } = makeSession({
+      config: { folderRoots: fr(['FB', 'Beta'], ['FBB', 'BetaBackup']) },
+      cursor: { delta_tokens: { FB: 'TB', FBB: 'TBB' }, scope_roots: ['FB', 'FBB'] } as OneDriveCursor,
+    });
+    const { channel } = makeFolderChannel({ picked: [node('FB', 'Beta')] });
+
+    const out = await source.manageFolders!(session, channel);
+
+    // `/BetaBackup/` is NOT under `/Beta/`, so it leaves scope: archived, not
+    // exempted and not re-attributed.
+    expect(out.archiveScopeRootIds).toEqual(['FBB']);
+    expect(out.reattributeScopeRoots ?? []).toEqual([]);
+    // …and FB is untouched: no overlap, so it keeps its delta token.
+    expect(out.cursor).toEqual({ delta_tokens: { FB: 'TB' }, scope_roots: ['FB'] });
+
+    const after = applyFolderScope([row('doc-b', 'FB'), row('doc-bb', 'FBB')], out);
+    expect(after).toEqual([
+      { externalId: 'doc-b', scopeRootId: 'FB', archived: false },
+      { externalId: 'doc-bb', scopeRootId: 'FBB', archived: true },
+    ]);
+    expect(liveOutsideScope(after, out.config)).toEqual([]);
   });
 });
 

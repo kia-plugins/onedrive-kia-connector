@@ -906,21 +906,51 @@ export async function resolveRootLocation(
   return { drive, path: `${decodeURIComponent(parent)}/${name}/`.replace(/\/+/g, '/') };
 }
 
+/**
+ * `p` is `root` itself or lives anywhere under it, respecting the separator
+ * BOUNDARY: `/Docs` does not contain `/DocsBackup`. Same shape as core's
+ * `@shared/folder-paths.ts:isUnder`, which is where this belongs
+ * conceptually — it is duplicated rather than imported because a connector
+ * is a standalone bundle with no access to core's internals.
+ *
+ * C-46/D4: `covers`/`overlaps` used a bare `startsWith`, so a removed sibling
+ * whose NAME EXTENDS a retained root read as contained and was silently
+ * exempted from archival. Measured reach of that defect through
+ * `manageFolders` TODAY: none — every path `resolveRootLocation` builds
+ * already ends in `/` (it appends one, and the drive root is the literal
+ * `'/'`), and `/DocsBackup/` does not `startsWith` `/Docs/`. The boundary
+ * check makes the predicates correct INDEPENDENT of that undocumented
+ * convention instead of resting on it, which is the point: nothing in the
+ * types says a `RootLocation.path` is slash-terminated, and both predicates
+ * are exported.
+ *
+ * Single separator only (`/`): these are Graph paths, never OS paths, so
+ * core's extra `\\` handling has nothing to match here.
+ */
+const isUnderPath = (p: string, root: string): boolean => {
+  if (p === root) return true;
+  if (!p.startsWith(root)) return false;
+  return root.endsWith('/') || p.charAt(root.length) === '/';
+};
+
 /** `retained` is an ancestor-or-self of `removed`: NOTHING under the removed
- *  root leaves scope, so it must not be archived (DECISIONS R8). */
-const covers = (retained: RootLocation | null, removed: RootLocation | null): boolean =>
+ *  root leaves scope, so it must not be archived (DECISIONS R8). Exported for
+ *  the C-46/D4 boundary unit tests, which are the only way to exercise a
+ *  non-slash-terminated path. */
+export const covers = (retained: RootLocation | null, removed: RootLocation | null): boolean =>
   retained !== null &&
   removed !== null &&
   retained.drive === removed.drive &&
-  removed.path.startsWith(retained.path);
+  isUnderPath(removed.path, retained.path);
 
 /** The two roots share a subtree in EITHER direction — the precondition for
- *  first-root-wins attribution to have named the wrong root. */
-const overlaps = (a: RootLocation | null, b: RootLocation | null): boolean =>
+ *  first-root-wins attribution to have named the wrong root. Boundary-aware
+ *  for the same reason as `covers` (C-46/D4). */
+export const overlaps = (a: RootLocation | null, b: RootLocation | null): boolean =>
   a !== null &&
   b !== null &&
   a.drive === b.drive &&
-  (a.path.startsWith(b.path) || b.path.startsWith(a.path));
+  (isUnderPath(a.path, b.path) || isUnderPath(b.path, a.path));
 
 export interface OneDriveTestSeams extends Partial<Pick<GraphClientDeps, 'sleep' | 'random'>> {
   batchByteBudget?: number;
