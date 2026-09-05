@@ -906,6 +906,89 @@ export async function resolveRootLocation(
   return { drive, path: `${decodeURIComponent(parent)}/${name}/`.replace(/\/+/g, '/') };
 }
 
+/** Ancestor-walk backstop. A OneDrive tree cannot be this deep; the loop's
+ *  real exit is reaching the drive root or a foreign drive. */
+const MAX_EXPAND_HOPS = 64;
+
+/**
+ * C-50 — the ANCESTOR ids of the account's current roots, for
+ * `FolderPickerSpec.expand`, so Manage folders opens REVEALED down to each
+ * tracked folder instead of collapsed behind one "OneDrive" row.
+ *
+ * The renderer cannot derive this: a Graph item id is opaque to it and the
+ * picker's tree paths are synthetic. Only the source can walk
+ * `parentReference`, so the source ships the answer and the modal matches it
+ * by equality against the ids `listChildFolders` returns.
+ *
+ * This walks parent IDS, not the `{drive, path}` locations
+ * `resolveRootLocation` builds: the picker addresses rows by item id, and a
+ * path cannot be matched against a listing without one Graph GET per segment
+ * anyway. Three terminations:
+ *  - the parent IS the drive root (`/drive/root:` with nothing after it) →
+ *    emit `ONEDRIVE_DRIVE_ROOT_ID`, which is the literal id the "My files"
+ *    tab lists, exactly as google-docs maps its chain end to `'root'`;
+ *  - a `/drives/{id}/root:` path → the chain has left into a shared drive,
+ *    whose ancestors the picker never lists (the "Shared with me" tab shows
+ *    those roots directly), so stop without emitting;
+ *  - anything unreadable or malformed → stop.
+ *
+ * Failure policy is the OPPOSITE of `resolveRootLocation`, deliberately, and
+ * for the same reason google-docs' `expandIdsFor` swallows: that function
+ * decides what gets ARCHIVED and must abort a save rather than guess, while
+ * this one is cosmetic and runs BEFORE the modal opens. Removing a root that
+ * vanished upstream is the main reason to open Manage folders, so a reveal
+ * must never be able to keep the user out of the editor.
+ */
+export async function expandIdsFor(
+  client: GraphClient,
+  selected: readonly { id: string; name: string }[],
+): Promise<string[]> {
+  type Ref = {
+    id?: string;
+    name?: string;
+    parentReference?: { driveId?: string; id?: string; path?: string };
+  };
+  const out = new Set<string>();
+  const cache = new Map<string, Ref | null>();
+  const get = async (id: string): Promise<Ref | null> => {
+    const hit = cache.get(id);
+    if (hit !== undefined) return hit;
+    let item: Ref | null;
+    try {
+      item = await client.request<Ref>(
+        `${GRAPH_BASE}/me/drive/items/${encodeURIComponent(id)}?$select=id,name,parentReference`,
+      );
+    } catch {
+      item = null;
+    }
+    cache.set(id, item);
+    return item;
+  };
+
+  for (const sel of selected) {
+    if (sel.id === ONEDRIVE_DRIVE_ROOT_ID) continue; // the catch-all IS a root row
+    let current = sel.id;
+    const visited = new Set<string>([current]);
+    for (let hops = 0; hops < MAX_EXPAND_HOPS; hops++) {
+      const ref = (await get(current))?.parentReference;
+      const raw = ref?.path;
+      if (!raw) break;
+      const mine = /^\/drive\/root:?/.exec(raw);
+      if (!mine) break; // a shared/foreign drive — its ancestors are never listed
+      if (raw.slice(mine[0].length).replace(/\/+$/, '') === '') {
+        out.add(ONEDRIVE_DRIVE_ROOT_ID);
+        break;
+      }
+      const parentId = ref?.id;
+      if (!parentId || visited.has(parentId)) break; // unknown parent, or a cycle
+      visited.add(parentId);
+      out.add(parentId);
+      current = parentId;
+    }
+  }
+  return [...out];
+}
+
 /**
  * `p` is `root` itself or lives anywhere under it, respecting the separator
  * BOUNDARY: `/Docs` does not contain `/DocsBackup`. Same shape as core's
@@ -1154,6 +1237,11 @@ export function createOneDriveSource(
       const priorIds = new Set(prior.map((r) => r.rootFolderId));
 
       channel.status('Loading your OneDrive folders…');
+      const selectedNodes = prior.map((r) => ({
+        id: r.rootFolderId,
+        name: r.rootName,
+        hasChildren: true,
+      }));
       const picked = await channel.pickFolders({
         modes: [
           { key: 'my-files', label: 'My files' },
@@ -1167,7 +1255,10 @@ export function createOneDriveSource(
         children: (id) => listChildFolders(client, id),
         count: (id) => countChildren(client, id),
         // The complete current covering set, pre-checked AND removable.
-        selected: prior.map((r) => ({ id: r.rootFolderId, name: r.rootName, hasChildren: true })),
+        selected: selectedNodes,
+        // C-50: open revealed down to the tracked folders. Walked before the
+        // modal renders, so `status` above is what the user sees meanwhile.
+        expand: await expandIdsFor(client, selectedNodes),
         purpose: 'manage',
       });
       if (picked.length === 0) throw new Error('onedrive: no folders selected');

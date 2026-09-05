@@ -128,7 +128,7 @@ describe('manageFolders', () => {
     expect(typeof source.reauthenticate).toBe('function');
   });
 
-  it('pre-selects the current roots, returns canonical folderRoots, and costs no Graph lookups on a pure ADD', async () => {
+  it('pre-selects the current roots, returns canonical folderRoots, and costs no SAVE-path Graph lookups on a pure ADD', async () => {
     const { source, calls } = makeSource();
     const { session } = makeSession({
       config: { folderRoots: fr(['FB', 'Beta']) },
@@ -153,7 +153,106 @@ describe('manageFolders', () => {
     expect(out.cursor).toEqual({ delta_tokens: { FB: 'TB' }, scope_roots: ['FB', 'FG'] });
     expect(out.archiveScopeRootIds).toEqual([]);
     expect(out.archiveNullScoped).toBe(false);
-    expect(calls).toEqual([]);
+    // A pure ADD still resolves NOTHING on the save path — the containment
+    // walk is what this pins, and it never runs. The one call here is C-50's
+    // reveal, which walks each PRESELECTED root's parents once before the
+    // modal opens so the picker does not open collapsed.
+    expect(calls).toEqual([
+      `${GRAPH_BASE}/me/drive/items/FB?$select=id,name,parentReference`,
+    ]);
+  });
+
+  /**
+   * C-50 — the picker must OPEN revealed down to the tracked folders. Graph
+   * item ids are opaque to the renderer, so the source walks
+   * `parentReference` and the modal matches the ids by equality.
+   */
+  describe('spec.expand (C-50 reveal)', () => {
+    /** Fixtures that carry `parentReference.id` — the parent ITEM id, which
+     *  the pre-C-50 fixtures never needed and so never set. */
+    const nested: GraphWorld['items'] = {
+      DEEP: driveFolder('DEEP', 'Deep', {
+        parentReference: { driveId: 'drive-1', id: 'MID', path: '/drive/root:/Top/Mid' },
+      }),
+      MID: driveFolder('MID', 'Mid', {
+        parentReference: { driveId: 'drive-1', id: 'TOP', path: '/drive/root:/Top' },
+      }),
+      TOP: driveFolder('TOP', 'Top', {
+        parentReference: { driveId: 'drive-1', id: 'root', path: '/drive/root:' },
+      }),
+      SHARED: driveFolder('SHARED', 'Team specs', {
+        parentReference: { driveId: 'other-drive', id: 'X1', path: '/drives/other-drive/root:/Specs' },
+      }),
+    };
+
+    it('maps a top-level root to the id the "My files" tab actually lists', async () => {
+      // TOP's parent IS the drive root, so the chain ends at the literal id
+      // the tab lists. Emitting anything else would match no row.
+      const { source } = makeSource(nested);
+      const { session } = makeSession({ config: { folderRoots: fr(['TOP', 'Top']) } });
+      const { channel, getPickerSpec } = makeFolderChannel({ picked: [node('TOP', 'Top')] });
+
+      await source.manageFolders!(session, channel);
+
+      expect(getPickerSpec()!.expand).toEqual([ONEDRIVE_DRIVE_ROOT_ID]);
+    });
+
+    it('walks a nested root to its full chain and never lists the root itself', async () => {
+      const { source } = makeSource(nested);
+      const { session } = makeSession({ config: { folderRoots: fr(['DEEP', 'Deep']) } });
+      const { channel, getPickerSpec } = makeFolderChannel({ picked: [node('DEEP', 'Deep')] });
+
+      await source.manageFolders!(session, channel);
+
+      // Nearest-first, ending at the tab's root id. DEEP is absent:
+      // expanding a selected row buys nothing and costs a listing.
+      expect(getPickerSpec()!.expand).toEqual(['MID', 'TOP', ONEDRIVE_DRIVE_ROOT_ID]);
+    });
+
+    it('stops at a shared drive, whose ancestors the picker never lists', async () => {
+      // "Shared with me" lists those roots DIRECTLY; there is no row above
+      // one, so emitting its foreign ancestors would match nothing.
+      const { source } = makeSource(nested);
+      const { session } = makeSession({ config: { folderRoots: fr(['SHARED', 'Team specs']) } });
+      const { channel, getPickerSpec } = makeFolderChannel({
+        picked: [node('SHARED', 'Team specs')],
+      });
+
+      await source.manageFolders!(session, channel);
+
+      expect(getPickerSpec()!.expand).toEqual([]);
+    });
+
+    it('an unreadable root reveals less instead of keeping the user out of the editor', async () => {
+      // Removing a vanished root is the main reason to open Manage folders,
+      // so the reveal must never throw past the picker. GONE is absent from
+      // the world; DEEP still reveals.
+      const { source } = makeSource(nested);
+      const { session } = makeSession({
+        config: { folderRoots: fr(['GONE', 'Deleted'], ['DEEP', 'Deep']) },
+      });
+      const { channel, getPickerSpec } = makeFolderChannel({
+        picked: [node('GONE', 'Deleted'), node('DEEP', 'Deep')],
+      });
+
+      await source.manageFolders!(session, channel);
+
+      expect(getPickerSpec()!.expand).toEqual(['MID', 'TOP', ONEDRIVE_DRIVE_ROOT_ID]);
+    });
+
+    it("the drive-root catch-all expands nothing — it IS a root row", async () => {
+      const { source } = makeSource(nested);
+      const { session } = makeSession({
+        config: { folderRoots: fr([ONEDRIVE_DRIVE_ROOT_ID, 'OneDrive']) },
+      });
+      const { channel, getPickerSpec } = makeFolderChannel({
+        picked: [node(ONEDRIVE_DRIVE_ROOT_ID, 'OneDrive')],
+      });
+
+      await source.manageFolders!(session, channel);
+
+      expect(getPickerSpec()!.expand).toEqual([]);
+    });
   });
 
   it('keeps retained roots in their prior config order and appends new ones — order is semantic', async () => {
