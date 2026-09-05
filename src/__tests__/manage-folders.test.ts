@@ -2,12 +2,15 @@
  * manageFolders(session, channel): edit an existing account's tracked roots
  * with its OWN session credentials — canonical config out (with any legacy
  * `roots` mirror passed through untouched, A-2), a pruned and backfill-free
- * cursor out, the connector-computed archive set (DECISIONS R8) including the
- * shared-ancestor carve-out (spec-reality-diff A5b), and A-3's
- * archiveNullScoped pairing. This connector has no reconcile(), so the archive
- * set computed here is the ONLY removal path OneDrive will ever have:
- * over-archiving is unrecoverable, so every ambiguous case must resolve to
- * "archive nothing".
+ * cursor out, the connector-computed archive set (DECISIONS R8), the
+ * shared-ancestor carve-out (spec-reality-diff A5b) — which since C-46/D3 is
+ * a RE-ATTRIBUTION rather than a silence — and A-3's archiveNullScoped
+ * pairing. This connector has no reconcile(), so what is computed here is the
+ * ONLY scope-removal path OneDrive will ever have, in both directions:
+ * over-archiving is unrecoverable, so an ambiguous case must never archive;
+ * and under-archiving leaks, so a removed root that is NOT archived must be
+ * re-attributed to the retained root that covers it. Every removed root lands
+ * in exactly one of the two lists.
  */
 import {
   GRAPH_BASE,
@@ -102,6 +105,14 @@ const worldItems: GraphWorld['items'] = {
   // `/Beta/`. Nothing under it is contained by FB.
   FBB: driveFolder('FBB', 'BetaBackup'),
   SH1: { id: 'SH1', name: 'Shared specs', folder: { childCount: 1 } },
+  // C-46/D3's two-edit scenario. FP = `/Papers/`, FA = `/Papers/Alpha/` (it
+  // was picked as a top-level root and has since MOVED under Papers
+  // upstream), FZ = `/Zeta/`, unrelated to both.
+  FP: driveFolder('FP', 'Papers'),
+  FA: driveFolder('FA', 'Alpha', {
+    parentReference: { driveId: 'drive-1', path: '/drive/root:/Papers' },
+  }),
+  FZ: driveFolder('FZ', 'Zeta'),
 };
 
 function makeSource(items: GraphWorld['items'] = worldItems) {
@@ -173,7 +184,7 @@ describe('manageFolders', () => {
     expect(out.archiveNullScoped).toBe(false);
   });
 
-  it('a removed root still covered by a retained ANCESTOR archives NOTHING and drops the ancestor token (A5b)', async () => {
+  it('a removed root still covered by a retained ANCESTOR is RE-ATTRIBUTED, not archived, and drops the ancestor token (A5b + C-46/D3)', async () => {
     const { source } = makeSource();
     const { session } = makeSession({
       config: { folderRoots: fr(['FB', 'Beta'], ['FBSUB', 'Sub']) },
@@ -184,6 +195,11 @@ describe('manageFolders', () => {
     const out = await source.manageFolders!(session, channel);
 
     expect(out.archiveScopeRootIds).toEqual([]);
+    // …and the removed root's live rows are re-stamped onto its coverer
+    // rather than left carrying a stamp no later save can match (C-46/D3).
+    // Silence here is NOT the right answer: the re-walk the dropped token
+    // triggers cannot move a LIVE row's stamp (hashSkip, `source.ts:296`).
+    expect(out.reattributeScopeRoots).toEqual([{ from: 'FBSUB', to: 'FB' }]);
     expect(out.cursor).toEqual({ delta_tokens: {}, scope_roots: ['FB'] });
     // Every root re-establishes on the next pull, so the NULL repair is free
     // and recoverable here — A-3's pairing (Step 16's derivation).
@@ -201,6 +217,8 @@ describe('manageFolders', () => {
     const out = await source.manageFolders!(session, channel);
 
     expect(out.archiveScopeRootIds).toEqual(['FB']);
+    // A removed root is never in both lists — nothing covers FB here.
+    expect(out.reattributeScopeRoots).toEqual([]);
     expect(out.cursor).toEqual({ delta_tokens: {}, scope_roots: ['FBSUB'] });
     expect(out.archiveNullScoped).toBe(true);
   });
@@ -219,6 +237,7 @@ describe('manageFolders', () => {
     const out = await source.manageFolders!(session, channel);
 
     expect(out.archiveScopeRootIds).toEqual([]);
+    expect(out.reattributeScopeRoots).toEqual([{ from: 'FB', to: ONEDRIVE_DRIVE_ROOT_ID }]);
     expect(out.cursor).toEqual({ delta_tokens: {}, scope_roots: [ONEDRIVE_DRIVE_ROOT_ID] });
     expect(out.archiveNullScoped).toBe(true);
   });
@@ -234,6 +253,7 @@ describe('manageFolders', () => {
     const out = await source.manageFolders!(session, channel);
 
     expect(out.archiveScopeRootIds).toEqual(['SH1']);
+    expect(out.reattributeScopeRoots).toEqual([]);
     expect(out.cursor).toEqual({ delta_tokens: { FB: 'TB' }, scope_roots: ['FB'] });
     expect(out.archiveNullScoped).toBe(false);
   });
@@ -415,6 +435,83 @@ describe('C-46/D4 — a name-extending SIBLING is not covered and its documents 
       { externalId: 'doc-bb', scopeRootId: 'FBB', archived: true },
     ]);
     expect(liveOutsideScope(after, out.config)).toEqual([]);
+  });
+});
+
+describe('C-46/D3 — stale attribution must not leak documents across successive edits', () => {
+  it('two edits — remove a covered root, then remove its coverer — leave nothing live outside scope', async () => {
+    // Edit 0 state: FA and FP are both tracked, and a pull has stamped one
+    // document under each. FA has since moved under FP upstream.
+    let rows = [row('doc-a', 'FA'), row('doc-p', 'FP')];
+
+    // ── Edit 1: drop FA, keep FP. FP covers FA, so nothing leaves scope —
+    // but the live rows stamped 'FA' must not KEEP that stamp: `hashSkip`
+    // freezes attribution on an unchanged live row, so no later pull ever
+    // refreshes it (C-46 addendum #6, measured). The save must re-attribute.
+    const { source: s1 } = makeSource();
+    const { session: sess1 } = makeSession({
+      config: { folderRoots: fr(['FA', 'Alpha'], ['FP', 'Papers']) },
+      cursor: { delta_tokens: { FA: 'TA', FP: 'TP' }, scope_roots: ['FA', 'FP'] } as OneDriveCursor,
+    });
+    const { channel: ch1 } = makeFolderChannel({ picked: [node('FP', 'Papers')] });
+
+    const out1 = await s1.manageFolders!(sess1, ch1);
+
+    expect(out1.archiveScopeRootIds).toEqual([]);
+    expect(out1.reattributeScopeRoots).toEqual([{ from: 'FA', to: 'FP' }]);
+    rows = applyFolderScope(rows, out1);
+    expect(rows.map((r) => r.scopeRootId)).toEqual(['FP', 'FP']);
+    expect(liveOutsideScope(rows, out1.config)).toEqual([]);
+
+    // ── Edit 2: replace FP with the unrelated FZ. FP leaves scope with no
+    // retained coverer, so it is archived — and every row the first edit
+    // handled must be archived with it, because they are all in FP's subtree.
+    const { source: s2 } = makeSource();
+    const { session: sess2 } = makeSession({ config: out1.config, cursor: out1.cursor });
+    const { channel: ch2 } = makeFolderChannel({ picked: [node('FZ', 'Zeta')] });
+
+    const out2 = await s2.manageFolders!(sess2, ch2);
+
+    expect(out2.archiveScopeRootIds).toEqual(['FP']);
+    expect(out2.reattributeScopeRoots).toEqual([]);
+    rows = applyFolderScope(rows, out2);
+
+    // The whole point: no document survives LIVE outside the selection. Left
+    // stamped 'FA', doc-a matches neither archive list and is searchable
+    // forever — this connector has no reconcile() to notice it later.
+    expect(liveOutsideScope(rows, out2.config)).toEqual([]);
+    expect(rows).toEqual([
+      { externalId: 'doc-a', scopeRootId: 'FP', archived: true },
+      { externalId: 'doc-p', scopeRootId: 'FP', archived: true },
+    ]);
+  });
+
+  it('re-attribution and archival are DISJOINT — core throws when a root is in both', async () => {
+    // FA is covered by FP and FG is not, in ONE save: the covered root goes
+    // to reattribute, the uncovered one to archive, and neither appears twice.
+    const { source } = makeSource();
+    const { session } = makeSession({
+      config: { folderRoots: fr(['FA', 'Alpha'], ['FG', 'Gamma'], ['FP', 'Papers']) },
+      cursor: {
+        delta_tokens: { FA: 'TA', FG: 'TG', FP: 'TP' },
+        scope_roots: ['FA', 'FG', 'FP'],
+      } as OneDriveCursor,
+    });
+    const { channel } = makeFolderChannel({ picked: [node('FP', 'Papers')] });
+
+    const out = await source.manageFolders!(session, channel);
+
+    expect(out.reattributeScopeRoots).toEqual([{ from: 'FA', to: 'FP' }]);
+    expect(out.archiveScopeRootIds).toEqual(['FG']);
+    const froms = new Set((out.reattributeScopeRoots ?? []).map((m) => m.from));
+    expect(out.archiveScopeRootIds.filter((id) => froms.has(id))).toEqual([]);
+
+    // …and the model of core's transaction accepts it (it throws on overlap).
+    const after = applyFolderScope([row('doc-a', 'FA'), row('doc-g', 'FG')], out);
+    expect(after).toEqual([
+      { externalId: 'doc-a', scopeRootId: 'FP', archived: false },
+      { externalId: 'doc-g', scopeRootId: 'FG', archived: true },
+    ]);
   });
 });
 

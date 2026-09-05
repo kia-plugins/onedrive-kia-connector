@@ -1186,6 +1186,7 @@ export function createOneDriveSource(
       const retained = prior.filter((r) => byId.has(r.rootFolderId));
 
       const archiveScopeRootIds: string[] = [];
+      const reattributeScopeRoots: Array<{ from: string; to: string }> = [];
       const dropTokens = new Set<string>();
       if (removed.length > 0) {
         channel.status('Checking which folders are still covered…');
@@ -1198,13 +1199,15 @@ export function createOneDriveSource(
         }
         for (const r of removed) {
           const loc = where.get(r.rootFolderId) ?? null;
-          let covered = false;
+          let coveredBy: string | null = null;
           for (const k of retained) {
             const kloc = where.get(k.rootFolderId) ?? null;
             // A retained ANCESTOR still contains the removed root's whole
-            // subtree, so nothing leaves scope — the empty archive set is the
-            // correct answer, not a fudge (DECISIONS R8).
-            if (covers(kloc, loc)) covered = true;
+            // subtree, so nothing leaves scope and archiving would be wrong
+            // (DECISIONS R8). The FIRST such root in config order wins, which
+            // is the same tie-break `deps.processed` uses when two roots both
+            // contain a file.
+            if (coveredBy === null && covers(kloc, loc)) coveredBy = k.rootFolderId;
             // Overlap in EITHER direction means first-root-wins attribution
             // (a config-ORDER artifact, `deps.processed`, `:463-468`) may
             // have stamped documents in the shared region with the wrong
@@ -1212,16 +1215,36 @@ export function createOneDriveSource(
             // pull re-walks the region (spec-reality-diff A5b). Cost:
             // `hashSkip` gates before any download, so every LIVE row in the
             // shared region is re-read as metadata pages and never
-            // re-downloaded. Rows this save ARCHIVES are the exception:
-            // `hashSkip` returns false for an archived row
-            // (`src/source.ts:296`), so the re-walk re-emits — hence
-            // un-archives — any of them a retained root genuinely still
-            // contains, and those DO cost a re-download. That is the price of
-            // attribution that self-heals, and it is the only such mechanism
-            // this connector has (there is no `reconcile()`).
+            // re-downloaded.
+            //
+            // ⚠️ C-46/D3 — THE RE-WALK DOES NOT RE-STAMP A LIVE ROW. An
+            // earlier draft of this comment claimed the token drop made
+            // attribution "self-heal"; it does not, and that false claim is
+            // what hid this defect. `hashSkip` (`src/source.ts:296`, gating
+            // inside `buildItem` at `:403`) returns `null` for an unchanged
+            // LIVE row BEFORE attribution is touched, so the re-walk emits
+            // nothing for it and `scope_root_id` keeps whatever the first
+            // pull wrote. Measured, not argued (C-46 addendum #6). The token
+            // drop still earns its keep — it re-walks the shared region, and
+            // rows this save ARCHIVES are re-emitted (hence un-archived,
+            // since `hashSkip` returns false for an archived row) at the cost
+            // of a re-download. What it cannot do is move a live row's stamp.
+            // `reattributeScopeRoots` below is what closes that gap.
             if (overlaps(kloc, loc)) dropTokens.add(k.rootFolderId);
           }
-          if (!covered) archiveScopeRootIds.push(r.rootFolderId);
+          // C-46/D3+D5, the third verb. A covered root must NOT be silently
+          // skipped: its live rows stay stamped with the REMOVED id, and a
+          // later save that removes the COVERING root archives by an `IN`-list
+          // over `scope_root_id` — which those rows no longer match. They
+          // would then be live, outside the selection, forever; this connector
+          // has no `reconcile()` to notice. Re-attribution re-stamps them onto
+          // the covering root inside core's same transaction: one UPDATE, no
+          // network, no re-download, no searchability gap.
+          //
+          // The two lists are DISJOINT by construction — every removed root
+          // takes exactly one branch — and core THROWS if they ever overlap.
+          if (coveredBy === null) archiveScopeRootIds.push(r.rootFolderId);
+          else reattributeScopeRoots.push({ from: r.rootFolderId, to: coveredBy });
         }
       }
 
@@ -1295,7 +1318,7 @@ export function createOneDriveSource(
         folderRoots: ordered.map((n) => ({ id: n.id, name: n.name })),
       };
 
-      return { config, cursor, archiveScopeRootIds, archiveNullScoped };
+      return { config, cursor, archiveScopeRootIds, reattributeScopeRoots, archiveNullScoped };
     },
 
     /**
