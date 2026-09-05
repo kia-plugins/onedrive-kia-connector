@@ -21,6 +21,7 @@ import type {
   Document,
   FolderNode,
   FolderPickerSpec,
+  FolderSelectionChannel,
   HostFor,
   Query,
   Session,
@@ -231,6 +232,9 @@ export function makeSession(
   opts: {
     creds?: Credentials | null;
     config?: Record<string, unknown>;
+    /** `manageFolders` transforms `session.account.cursor`, so suites need to
+     *  seed it — `pull()` takes its cursor as an argument instead. */
+    cursor?: unknown;
     signal?: AbortSignal;
   } = {},
 ): { session: Session; logs: { level: string; msg: string }[] } {
@@ -242,7 +246,7 @@ export function makeSession(
       identifier: 'user@example.com',
       config: opts.config ?? {},
       status: 'live',
-      cursor: null,
+      cursor: opts.cursor ?? null,
       createdAt: '2026-01-01T00:00:00Z',
     },
     // undefined = the default live token; an explicit null is the
@@ -324,6 +328,7 @@ export function fakeDoc(
     title: externalId,
     markdown: '',
     metadata,
+    scopeRootId: null,
     createdAt: null,
     contentHash: 'hash-x',
     seq: 1,
@@ -372,4 +377,35 @@ export async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
   const out: T[] = [];
   for await (const v of iter) out.push(v);
   return out;
+}
+
+/** A `FolderSelectionChannel` fake — the manage-folders analogue of
+ *  `makeAuth`, minus every authenticating verb (that absence is the point:
+ *  managing folders must never be able to start an OAuth flow).
+ *
+ *  Deliberately LOCAL rather than the SDK kit's `fakeFolderSelectionChannel`:
+ *  that helper is Task 10's deliverable and its shape is not frozen in the
+ *  contract, so this connector must not take a build dependency on it. */
+export function makeFolderChannel(
+  opts: {
+    /** pickFolders resolves this selection — or, when a function, drives the
+     *  spec itself (to inspect callbacks, or to reject as a user cancel). */
+    picked?: FolderNode[] | ((spec: FolderPickerSpec) => Promise<FolderNode[]>);
+  } = {},
+): {
+  channel: FolderSelectionChannel;
+  statuses: string[];
+  getPickerSpec: () => FolderPickerSpec | undefined;
+} {
+  const statuses: string[] = [];
+  let pickerSpec: FolderPickerSpec | undefined;
+  const channel: FolderSelectionChannel = {
+    status: (msg) => statuses.push(msg),
+    pickFolders: async (spec) => {
+      pickerSpec = spec;
+      if (typeof opts.picked === 'function') return opts.picked(spec);
+      return opts.picked ?? [];
+    },
+  };
+  return { channel, statuses, getPickerSpec: () => pickerSpec };
 }
