@@ -40,7 +40,9 @@
  * a uniform error shape.
  */
 
-export type NetFetch = (url: string, init?: unknown) => Promise<unknown>;
+// The host's own net.fetch type (PluginNet['fetch']), via the SDK.
+import type { NetFetch } from '@kiagent/connector-sdk/http';
+export type { NetFetch };
 
 /** Graph API root. Lives here (rather than source.ts) so tree.ts can import
  *  it without a source.ts ↔ tree.ts circular dependency. */

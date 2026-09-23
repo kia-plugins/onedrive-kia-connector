@@ -103,6 +103,7 @@ import {
   OneDriveAuthError,
   isAuthError,
   type GraphClientDeps,
+  type NetFetch,
 } from './client';
 import { buildDisplayPath } from './path-resolver';
 import { chooseRoute } from './mime-route';
@@ -315,7 +316,7 @@ interface ItemDeps {
   client: GraphClient;
   session: Session;
   query: Query;
-  fetchFn: (url: string, init?: unknown) => Promise<unknown>;
+  fetchFn: NetFetch;
   /** Item ids already emitted THIS pull() call — guards overlapping
    *  configured roots (see module doc). */
   processed: Set<string>;
@@ -374,7 +375,7 @@ async function refreshDownloadUrl(client: GraphClient, itemId: string): Promise<
  *  — the caller (`buildItem`) handles exactly one 403-refresh-and-retry, v1's
  *  own contract. */
 async function downloadBytes(
-  fetchFn: (url: string, init?: unknown) => Promise<unknown>,
+  fetchFn: NetFetch,
   url: string,
 ): Promise<Uint8Array> {
   const res = (await fetchFn(url)) as { status: number; body: Uint8Array };
@@ -678,7 +679,7 @@ async function* backfill(
   client: GraphClient,
   session: Session,
   query: Query,
-  fetchFn: (url: string, init?: unknown) => Promise<unknown>,
+  fetchFn: NetFetch,
   cursor: OneDriveCursor | null,
   roots: RootConfig[],
   processed: Set<string>,
@@ -807,7 +808,7 @@ async function* delta(
   client: GraphClient,
   session: Session,
   query: Query,
-  fetchFn: (url: string, init?: unknown) => Promise<unknown>,
+  fetchFn: NetFetch,
   cursor: OneDriveCursor,
   roots: RootConfig[],
   processed: Set<string>,
