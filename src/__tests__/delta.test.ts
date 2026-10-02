@@ -297,7 +297,7 @@ describe('policy_version re-enumeration', () => {
     });
   });
 
-  it('a partially backfilled old cursor re-walks every root, keeps its old token, and polls it', async () => {
+  it('a partially backfilled old cursor re-walks every root, keeps its old token, and polls only that one', async () => {
     const twoRoots = {
       roots: [
         { rootFolderId: 'FA', rootName: 'Alpha' },
@@ -311,7 +311,6 @@ describe('policy_version re-enumeration', () => {
           [deltaUrl('FA')]: { value: [], '@odata.deltaLink': finalLink('FA', 'NA') },
           [deltaUrl('FB')]: { value: [], '@odata.deltaLink': finalLink('FB', 'NB') },
           [deltaUrl('FA', 'OLD')]: { value: [deletedItem('gone')], '@odata.deltaLink': finalLink('FA', 'OLD2') },
-          [deltaUrl('FB', 'NB')]: { value: [], '@odata.deltaLink': finalLink('FB', 'NB2') },
         },
       },
       query,
@@ -321,7 +320,7 @@ describe('policy_version re-enumeration', () => {
     const batches = (await collect(source.pull(session, old))) as B[];
     expect(batches.flatMap((b) => b.deletions ?? [])).toEqual([{ externalId: 'gone', type: 'file' }]);
     expect(batches.at(-1)!.cursor).toEqual({
-      delta_tokens: { FA: 'OLD2', FB: 'NB2' },
+      delta_tokens: { FA: 'OLD2', FB: 'NB' },
       scope_roots: ['FA', 'FB'],
       policy_version: FILE_POLICY_VERSION,
     });

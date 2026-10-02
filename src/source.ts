@@ -1215,9 +1215,12 @@ export function createOneDriveSource(
           }
         };
         yield* stamp(rewalk());
-        if (session.signal.aborted || !backfillDone({ delta_tokens: tokens }, roots)) return;
+        // Only the kept tokens need the poll: a root that had none just got a
+        // fresh token from the re-walk itself.
+        const keptRoots = roots.filter((r) => typeof kept[r.rootFolderId] === 'string');
+        if (session.signal.aborted || !backfillDone({ delta_tokens: tokens }, roots) || keptRoots.length === 0) return;
         processed.clear();
-        yield* stamp(delta(client, session, host.query, host.net.fetch, { delta_tokens: tokens }, roots, processed, budget));
+        yield* stamp(delta(client, session, host.query, host.net.fetch, { delta_tokens: tokens }, keptRoots, processed, budget));
         return;
       }
       const walk = !backfillDone(start, roots)
