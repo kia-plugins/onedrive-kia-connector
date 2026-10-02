@@ -12,7 +12,7 @@
  * 403-refresh-and-retry.
  */
 import { createOneDriveSource, GRAPH_BASE, MAX_BINARY_BYTES, type OneDriveItem } from '../source';
-import type { Batch } from '@kiagent/connector-sdk';
+import { MAX_FETCH_BYTES, type Batch, type DocumentInput } from '@kiagent/connector-sdk';
 import {
   collect,
   deltaUrl,
@@ -227,26 +227,31 @@ describe('ingest routing', () => {
     expect(cleanLogs.some((l) => /ignored \d+ file/.test(l.msg))).toBe(false);
   });
 
-  it('skips all content I/O for a declared-too-large file (size field over the converter/PDF cap) — no item, no item-GET, no download', async () => {
-    const { source, calls } = makeSource({
-      deltaPages: {
-        [deltaUrl('FA')]: {
-          value: [driveFile('big1', 'huge.pdf', { size: MAX_BINARY_BYTES + 1 })],
-          '@odata.deltaLink': finalLink('FA', 'TOK1'),
-        },
-      },
-    });
+  const MiB = 1024 * 1024;
+  const one = (id: string, name: string, over = {}) => ({
+    [deltaUrl('FA')]: { value: [driveFile(id, name, over)], '@odata.deltaLink': finalLink('FA', 'TOK1') },
+  });
+  const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+  it('a 60 MiB PDF becomes a metadata-only deferred item: no item-GET, no download', async () => {
+    const { source, calls } = makeSource({ deltaPages: one('big', 'big.pdf', { size: 60 * MiB }) });
     const { session } = makeSession({ config: oneRoot });
-
-    const batches = (await collect(source.pull(session, null))) as B[];
-
-    expect(batches.flatMap((b) => b.items)).toEqual([]);
-    expect(calls.some((u) => u.includes('/me/drive/items/big1') && !u.includes('/delta'))).toBe(false);
+    const items = ((await collect(source.pull(session, null))) as B[]).flatMap((b) => b.items);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ markdown: '', extractionStatus: 'deferred' });
+    expect(items[0].bytes).toBeUndefined();
+    expect((source.toDocument(items[0]) as DocumentInput).metadata).toMatchObject({
+      extraction_status: 'deferred',
+      mime: 'application/pdf',
+      filename: 'big.pdf',
+      sizeBytes: 60 * MiB,
+    });
     expect(calls.some((u) => u.includes('download.example'))).toBe(false);
+    expect(calls.some((u) => u.includes('/me/drive/items/big') && !u.includes('/delta'))).toBe(false);
   });
 
-  it('the declared-size cap is inclusive: size === cap still downloads, size === cap+1 never reaches an item-GET or download', async () => {
-    const { source, calls } = makeSource({
+  it('the eager cap is inclusive: size === cap downloads, cap+1 is deferred', async () => {
+    const { source } = makeSource({
       deltaPages: {
         [deltaUrl('FA')]: {
           value: [
@@ -259,73 +264,122 @@ describe('ingest routing', () => {
       downloads: { 'https://download.example/atcap': new Uint8Array([1]) },
     });
     const { session } = makeSession({ config: oneRoot });
-
-    const batches = (await collect(source.pull(session, null))) as B[];
-
-    expect(batches.flatMap(ids)).toEqual(['atcap']);
-    expect(calls.some((u) => u.includes('/me/drive/items/overcap') && !u.includes('/delta'))).toBe(false);
-    expect(calls.includes('https://download.example/overcap')).toBe(false);
+    const items = ((await collect(source.pull(session, null))) as B[]).flatMap((b) => b.items);
+    expect(items.map((i) => [i.file.id, i.extractionStatus])).toEqual([
+      ['atcap', 'ok'],
+      ['overcap', 'deferred'],
+    ]);
   });
 
-  it('downloads, then drops, an unknown-declared-size file that turns out oversized post-download (no item emitted)', async () => {
-    const { source, calls } = makeSource({
+  it('a PDF over MAX_FETCH_BYTES and a 30 MiB docx are metadata-only "none" items', async () => {
+    const { source } = makeSource({
       deltaPages: {
         [deltaUrl('FA')]: {
-          value: [driveFile('nosize1', 'n.pdf', { size: undefined })],
+          value: [
+            driveFile('huge', 'huge.pdf', { size: MAX_FETCH_BYTES + 1 }),
+            driveFile('doc', 'big.docx', { size: 30 * MiB, file: { mimeType: DOCX } }),
+          ],
           '@odata.deltaLink': finalLink('FA', 'TOK1'),
         },
       },
-      downloads: { 'https://download.example/nosize1': new Uint8Array(MAX_BINARY_BYTES + 1) },
     });
     const { session } = makeSession({ config: oneRoot });
-
-    const batches = (await collect(source.pull(session, null))) as B[];
-
-    expect(batches.flatMap((b) => b.items)).toEqual([]);
-    // Unlike a declared-size cap, this one COULD only be discovered after the
-    // download actually ran (size was unknown going in).
-    expect(calls.some((u) => u.includes('download.example'))).toBe(true);
+    const items = ((await collect(source.pull(session, null))) as B[]).flatMap((b) => b.items);
+    expect(items.map((i) => [i.file.id, i.extractionStatus])).toEqual([
+      ['huge', 'none'],
+      ['doc', 'none'],
+    ]);
   });
 
-  it('post-download-oversize (unknown declared size) with a pre-existing live row is archived via exactly one deletion — this connector has no reconcile pass, so this IS the only chance to clean up the stale row', async () => {
-    const query = fakeQuery([fakeDoc('nosize2', 'file', { etag: 'etag-nosize2-OLD', extraction_status: 'ok' })]);
-    const { source, calls } = makeSource(
+  it('a 30 MiB PNG is still ignored, and its pre-existing live row is archived', async () => {
+    const query = fakeQuery([fakeDoc('img', 'file', { etag: 'old', extraction_status: 'ok' })]);
+    const { source } = makeSource(
+      { deltaPages: one('img', 'big.png', { size: 30 * MiB, file: { mimeType: 'image/png' } }) },
+      query,
+    );
+    const { session } = makeSession({ config: oneRoot });
+    const batches = (await collect(source.pull(session, null))) as B[];
+    expect(batches.flatMap((b) => b.items)).toEqual([]);
+    expect(batches.flatMap((b) => b.deletions ?? [])).toEqual([{ externalId: 'img', type: 'file' }]);
+  });
+
+  it('unknown declared size, 40 MiB after download → deferred item without bytes, no deletion', async () => {
+    const query = fakeQuery([fakeDoc('ns', 'file', { etag: 'etag-OLD', extraction_status: 'ok' })]);
+    const { source } = makeSource(
       {
-        deltaPages: {
-          [deltaUrl('FA')]: {
-            value: [driveFile('nosize2', 'n2.pdf', { size: undefined })],
-            '@odata.deltaLink': finalLink('FA', 'TOK1'),
-          },
-        },
-        downloads: { 'https://download.example/nosize2': new Uint8Array(MAX_BINARY_BYTES + 1) },
+        deltaPages: one('ns', 'n.pdf', { size: undefined }),
+        downloads: { 'https://download.example/ns': new Uint8Array(40 * MiB) },
       },
       query,
     );
     const { session } = makeSession({ config: oneRoot });
-
     const batches = (await collect(source.pull(session, null))) as B[];
-
-    expect(batches.flatMap((b) => b.items)).toEqual([]);
-    expect(batches.flatMap((b) => b.deletions ?? [])).toEqual([{ externalId: 'nosize2', type: 'file' }]);
-    expect(calls.some((u) => u.includes('download.example'))).toBe(true);
+    const items = batches.flatMap((b) => b.items);
+    expect(items.map((i) => i.extractionStatus)).toEqual(['deferred']);
+    expect(items[0].bytes).toBeUndefined();
+    expect(batches.flatMap((b) => b.deletions ?? [])).toEqual([]);
   });
 
-  it('post-download-oversize does NOT emit a deletion when there was no pre-existing live row to archive', async () => {
-    const { source } = makeSource({
-      deltaPages: {
-        [deltaUrl('FA')]: {
-          value: [driveFile('nosize3', 'n3.pdf', { size: undefined })],
-          '@odata.deltaLink': finalLink('FA', 'TOK1'),
-        },
-      },
-      downloads: { 'https://download.example/nosize3': new Uint8Array(MAX_BINARY_BYTES + 1) },
+  it('unknown declared size, 30 MiB docx after download → none, measured size persisted, fetchBytes refuses it', async () => {
+    const { source, calls } = makeSource({
+      deltaPages: one('nd', 'n.docx', { size: undefined, file: { mimeType: DOCX } }),
+      downloads: { 'https://download.example/nd': new Uint8Array(30 * MiB) },
     });
     const { session } = makeSession({ config: oneRoot });
+    const items = ((await collect(source.pull(session, null))) as B[]).flatMap((b) => b.items);
+    expect(items.map((i) => i.extractionStatus)).toEqual(['none']);
+    const doc = fakeDoc('nd', 'file', (source.toDocument(items[0]) as DocumentInput).metadata as Record<string, unknown>);
+    expect(doc.metadata).toMatchObject({ size_bytes: 30 * MiB, sizeBytes: 30 * MiB });
+    const before = calls.length;
+    expect(await source.fetchBytes!(session, doc)).toBeNull();
+    expect(calls.length).toBe(before);
+  });
 
+  it('a size-less file measured earlier as deferred is NOT re-downloaded on an unchanged re-listing', async () => {
+    const query = fakeQuery([
+      fakeDoc('ns2', 'file', { etag: 'etag-ns2-1', extraction_status: 'deferred', size_bytes: 40 * MiB }),
+    ]);
+    const { source, calls } = makeSource({ deltaPages: one('ns2', 'n2.pdf', { size: undefined }) }, query);
+    const { session } = makeSession({ config: oneRoot });
+    expect(((await collect(source.pull(session, null))) as B[]).flatMap(ids)).toEqual([]);
+    expect(calls.some((u) => u.includes('download.example'))).toBe(false);
+  });
+
+  it('unknown declared size, 30 MiB PNG after download → still ignored + archived', async () => {
+    const query = fakeQuery([fakeDoc('ni', 'file', { etag: 'etag-OLD', extraction_status: 'ok' })]);
+    const { source } = makeSource(
+      {
+        deltaPages: one('ni', 'n.png', { size: undefined, file: { mimeType: 'image/png' } }),
+        downloads: { 'https://download.example/ni': new Uint8Array(30 * MiB) },
+      },
+      query,
+    );
+    const { session } = makeSession({ config: oneRoot });
     const batches = (await collect(source.pull(session, null))) as B[];
-
     expect(batches.flatMap((b) => b.items)).toEqual([]);
-    expect(batches.flatMap((b) => b.deletions ?? [])).toEqual([]);
+    expect(batches.flatMap((b) => b.deletions ?? [])).toEqual([{ externalId: 'ni', type: 'file' }]);
+  });
+
+  it('hash-skip pins a deferred row whose eTag is unchanged (keeps the worker-converted text)', async () => {
+    const query = fakeQuery([fakeDoc('big', 'file', { etag: 'etag-big-1', extraction_status: 'deferred' })]);
+    const { source } = makeSource({ deltaPages: one('big', 'big.pdf', { size: 60 * MiB }) }, query);
+    const { session } = makeSession({ config: oneRoot });
+    expect(((await collect(source.pull(session, null))) as B[]).flatMap(ids)).toEqual([]);
+  });
+
+  it('hash-skip does NOT pin when the route changed (stored deferred, now eager after a shrink)', async () => {
+    const query = fakeQuery([fakeDoc('f', 'file', { etag: 'etag-f-1', extraction_status: 'deferred' })]);
+    const { source } = makeSource(
+      {
+        deltaPages: one('f', 'f.pdf', { size: 1000 }),
+        downloads: { 'https://download.example/f': new Uint8Array([1]) },
+      },
+      query,
+    );
+    const { session } = makeSession({ config: oneRoot });
+    expect(
+      ((await collect(source.pull(session, null))) as B[]).flatMap((b) => b.items).map((i) => i.extractionStatus),
+    ).toEqual(['ok']);
   });
 
   it('refreshes the downloadUrl when the delta payload omits it, then downloads successfully', async () => {

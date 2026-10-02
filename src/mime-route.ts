@@ -14,15 +14,17 @@
  * all derive from, so this connector can no longer drift from them. Under
  * `profile: 'cloud-drive'` the policy ignores archives at any size, all
  * cloud audio/video regardless of size, and anything outside its allowlist
- * — and caps PDFs/Office/text at `MAX_CLOUD_BINARY_BYTES` (25 MiB) and
- * images at `MAX_CLOUD_IMAGE_BYTES` (20 MiB). See `source.ts`'s `pageChunks`
- * for where the resulting `ignore` routes gate OUT of any content I/O
- * entirely (no downloadUrl refresh, no download).
+ * — and caps images at `MAX_CLOUD_IMAGE_BYTES` (20 MiB). Documents over the
+ * eager cap (`MAX_CLOUD_BINARY_BYTES`, 25 MiB) still get a row: the policy's
+ * `bytes` says `'deferred'` (core's convert worker fetches it later, up to
+ * `MAX_FETCH_BYTES`) or `'none'` (metadata only); only media is
+ * `too-large`. See `source.ts`'s `pageChunks` for where `ignore` routes gate
+ * OUT of any content I/O entirely (no downloadUrl refresh, no download).
  */
 import { decideFileIndexing, type FileIgnoreReason } from '@kiagent/connector-sdk';
 
 export type OneDriveRoute =
-  | { kind: 'binary'; pipeline: 'converter' | 'vision' }
+  | { kind: 'binary'; pipeline: 'converter' | 'vision'; bytes: 'eager' | 'deferred' | 'none' }
   | { kind: 'ignore'; reason: FileIgnoreReason };
 
 export function chooseRoute(mimeType: string, filename: string, sizeBytes?: number): OneDriveRoute {
@@ -34,5 +36,10 @@ export function chooseRoute(mimeType: string, filename: string, sizeBytes?: numb
   });
   return d.kind === 'ignore'
     ? d
-    : { kind: 'binary', pipeline: d.pipeline === 'vision' ? 'vision' : 'converter' };
+    : { kind: 'binary', pipeline: d.pipeline === 'vision' ? 'vision' : 'converter', bytes: d.bytes };
+}
+
+/** The `extraction_status` a row built from this route carries. */
+export function statusFor(route: Extract<OneDriveRoute, { kind: 'binary' }>): 'ok' | 'deferred' | 'none' {
+  return route.bytes === 'eager' ? 'ok' : route.bytes;
 }

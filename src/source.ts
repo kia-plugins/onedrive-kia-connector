@@ -106,7 +106,7 @@ import {
   type NetFetch,
 } from './client';
 import { buildDisplayPath } from './path-resolver';
-import { chooseRoute } from './mime-route';
+import { chooseRoute, statusFor, type OneDriveRoute } from './mime-route';
 import { countChildren, listChildFolders, listSharedRoots } from './tree';
 
 export { GRAPH_BASE };
@@ -192,14 +192,14 @@ export interface DriveItem {
 
 export interface OneDriveItem {
   file: DriveItem;
-  /** '' for the one remaining metadata-only case (downloadUrl unobtainable,
-   *  `extractionStatus: 'failed'`) — a file the eligibility policy has
-   *  already ruled IN never reaches this type at all when the policy rules
-   *  it OUT (see `pageChunks`'s ignore branch, which never calls
-   *  `buildItem`). null for binary items (the engine converts). */
+  /** '' for metadata-only items: `'deferred'`/`'none'` (a document over the
+   *  eager cap — core's convert worker fetches a deferred one later) and
+   *  `'failed'` (downloadUrl unobtainable). A file the eligibility policy
+   *  rules OUT never reaches this type (`pageChunks`'s ignore branch never
+   *  calls `buildItem`). null for binary items (the engine converts). */
   markdown: string | null;
   bytes?: Uint8Array;
-  extractionStatus: 'ok' | 'failed';
+  extractionStatus: 'ok' | 'deferred' | 'none' | 'failed';
   displayPath: string;
   rootFolderId: string;
 }
@@ -326,37 +326,46 @@ interface ItemDeps {
   ignored: IgnoreTally;
 }
 
-/** Query-first content-hash skip: an unchanged, still-live document is never
- *  re-downloaded (v1 ingest.ts's `canShortcut`, minus the metadata-only
- *  `last_seen_at` refresh — the v2 engine owns row freshness). An ARCHIVED
- *  match does NOT skip: re-emitting is what un-archives a doc that moved back
- *  into scope. Only an `'ok'` row (real, already-fetched content) is ever
- *  pinned behind an unchanged eTag. Anything else bypasses the pin: a
- *  'failed' row (v1's exact rationale — possibly just a quota storm; must
- *  retry) AND, just as importantly, a row carrying one of the PRE-migration
- *  statuses this connector used to write for an ineligible file
- *  (`'unsupported'`/`'too-large'`) — `pageChunks` only ever calls `hashSkip`
- *  for an item the CURRENT policy has judged eligible, so reaching here at
- *  all means a legacy row that used to be ineligible was just newly rescued
- *  by a policy change (e.g. an octet-stream-mime `.pdf` rescued by its
- *  extension). Pinning it on an unchanged eTag would strand it as
- *  contentless metadata forever, since nothing else in this connector will
- *  ever revisit it. */
-async function hashSkip(deps: ItemDeps, itemId: string, etag: string | undefined): Promise<boolean> {
+/** Hash-skip: a live row whose eTag is unchanged AND whose stored
+ *  `extraction_status` is the one the CURRENT route would write is pinned —
+ *  not re-emitted, not re-downloaded (v1 ingest.ts's `canShortcut`). For a
+ *  `'deferred'` row this is what keeps the convert worker's text: re-emitting
+ *  `markdown: ''` would discard it. An ARCHIVED match does NOT skip
+ *  (re-emitting un-archives a doc that moved back into scope). `'failed'`,
+ *  legacy `'unsupported'`/`'too-large'`, and any route change re-fetch: a
+ *  policy change that alters the route must never be stranded behind an
+ *  unchanged eTag. When upstream omitted the size, `recheck` routes by the
+ *  size measured on an earlier download (stored in `size_bytes`), or a
+ *  size-less file would be re-downloaded on every listing. */
+type Status = 'ok' | 'deferred' | 'none';
+async function hashSkip(
+  deps: ItemDeps,
+  itemId: string,
+  etag: string | undefined,
+  want: Status,
+  recheck?: (storedSize: number) => Status | 'ignore',
+): Promise<boolean> {
   if (!etag) return false;
   const existing = await deps.query.byExternalId(deps.session.account.id, itemId, 'file');
   if (!existing || existing.archivedAt) return false;
   const meta = existing.metadata as Record<string, unknown>;
-  if (meta.extraction_status !== 'ok') return false;
-  return meta.etag === etag;
+  if (meta.etag !== etag) return false;
+  if (meta.extraction_status === want) return true;
+  return (
+    recheck !== undefined && typeof meta.size_bytes === 'number' && meta.extraction_status === recheck(meta.size_bytes)
+  );
 }
 
-/** The one remaining metadata-only case: an eligible file whose downloadUrl
- *  could not be obtained even after a refresh (v1 parity — see `buildItem`).
- *  Ineligible files never reach here at all (`pageChunks` gates them out
- *  before `buildItem` is ever called). */
-function failedItem(raw: DriveItem, displayPath: string, rootFolderId: string): OneDriveItem {
-  return { file: raw, markdown: '', extractionStatus: 'failed', displayPath, rootFolderId };
+/** A metadata-only item: a document over the eager cap (`'deferred'` /
+ *  `'none'`), or an eligible file whose downloadUrl could not be obtained
+ *  even after a refresh (`'failed'`, v1 parity — see `buildItem`). */
+function metadataItem(
+  raw: DriveItem,
+  status: 'deferred' | 'none' | 'failed',
+  displayPath: string,
+  rootFolderId: string,
+): OneDriveItem {
+  return { file: raw, markdown: '', extractionStatus: status, displayPath, rootFolderId };
 }
 
 /** Do NOT pass `$select` here (v1 `refreshItemDownloadUrl` parity):
@@ -403,13 +412,23 @@ async function downloadBytes(
 async function buildItem(
   raw: DriveItem,
   root: RootConfig,
+  route: Extract<OneDriveRoute, { kind: 'binary' }>,
   deps: ItemDeps,
   deletions: ExternalRef[],
 ): Promise<OneDriveItem | null> {
   const mime = raw.file?.mimeType ?? 'application/octet-stream';
   const displayPath = buildDisplayPath({ rootName: root.rootName }, raw);
 
-  if (await hashSkip(deps, raw.id, raw.eTag)) return null;
+  const recheck =
+    raw.size == null
+      ? (n: number): Status | 'ignore' => {
+          const r = chooseRoute(mime, raw.name, n);
+          return r.kind === 'ignore' ? 'ignore' : statusFor(r);
+        }
+      : undefined;
+  if (await hashSkip(deps, raw.id, raw.eTag, statusFor(route), recheck)) return null;
+  // A document over the eager cap: a findable row, never downloaded here.
+  if (route.bytes !== 'eager') return metadataItem(raw, route.bytes, displayPath, root.rootFolderId);
 
   // v1 ingest.ts: Graph's per-item /delta response routinely omits
   // @microsoft.graph.downloadUrl (especially on MSA personal OneDrive) —
@@ -419,7 +438,7 @@ async function buildItem(
     downloadUrl = await refreshDownloadUrl(deps.client, raw.id);
   }
   if (!downloadUrl) {
-    return failedItem(raw, displayPath, root.rootFolderId);
+    return metadataItem(raw, 'failed', displayPath, root.rootFolderId);
   }
 
   let bytes: Uint8Array;
@@ -449,6 +468,13 @@ async function buildItem(
       deletions.push({ externalId: raw.id, type: 'file' });
     }
     return null;
+  }
+  if (postRoute.bytes !== 'eager') {
+    // Unknown declared size, oversized document: keep the row, drop the
+    // bytes, and RECORD the measured size — else fetchBytes (and core's
+    // convert worker) would re-route the size-less row as eager and download
+    // it again.
+    return metadataItem({ ...raw, size: bytes.byteLength }, postRoute.bytes, displayPath, root.rootFolderId);
   }
 
   return {
@@ -534,7 +560,7 @@ async function* pageChunks(
         deps.ignored.add(route.reason);
       } else {
         try {
-          const item = await buildItem(raw, root, deps, deletions);
+          const item = await buildItem(raw, root, route, deps, deletions);
           if (item) {
             items.push(item);
             bytes += item.bytes?.byteLength ?? 0;
@@ -1169,7 +1195,7 @@ export function createOneDriveSource(
         /** Folder scope: the tracked root whose delta feed emitted this item
          *  (first-root-wins under overlap — `deps.processed`, `:463-468`).
          *  ALWAYS set: every walk carries its `RootConfig` down to
-         *  `buildItem`/`failedItem`, so this connector never reaches the
+         *  `buildItem`/`metadataItem`, so this connector never reaches the
          *  engine's NULL-and-warn path (DECISIONS R5). `metadata.
          *  root_folder_id` below is kept as-is — core's v3 migration reads
          *  that spelling to backfill `scope_root_id` on existing rows. */
@@ -1202,6 +1228,8 @@ export function createOneDriveSource(
      *  vision worker's OCR/VLM two-pass pulls image/pdf bytes back through
      *  here). Pre-signed download URLs expire, so this always fetches a
      *  fresh one rather than trusting anything cached in metadata.
+     *  `deferred` rows are served (core's convert worker fetches them under
+     *  `MAX_FETCH_BYTES`); `none` rows never are.
      *  Classifies from stored metadata FIRST — an ignored route returns null
      *  before any client/OAuth/network work happens at all (no
      *  `clientFor(session)`, no downloadUrl refresh). */
@@ -1212,7 +1240,8 @@ export function createOneDriveSource(
       const mime = typeof meta.mime_type === 'string' ? meta.mime_type : '';
       const filename = typeof meta.filename === 'string' ? meta.filename : (doc.title ?? '');
       const size = typeof meta.size_bytes === 'number' ? meta.size_bytes : undefined;
-      if (chooseRoute(mime, filename, size).kind === 'ignore') return null;
+      const route = chooseRoute(mime, filename, size);
+      if (route.kind === 'ignore' || route.bytes === 'none') return null;
       const client = clientFor(session);
       try {
         const downloadUrl = await refreshDownloadUrl(client, itemId);

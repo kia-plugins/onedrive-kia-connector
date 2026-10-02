@@ -3,7 +3,9 @@
  */
 import { createOneDriveSource, MAX_BINARY_BYTES, type OneDriveItem } from '../source';
 import { GraphApiError } from '../client';
-import type { DocumentInput } from '@kiagent/connector-sdk';
+import { MAX_FETCH_BYTES, type DocumentInput } from '@kiagent/connector-sdk';
+
+const MiB = 1024 * 1024;
 import { driveFile, fakeDoc, graphFetch, instantClock, jsonRes, makeHost, makeSession } from '../testing/harness';
 
 function makeSource(world: Parameters<typeof graphFetch>[0] = {}) {
@@ -116,13 +118,13 @@ describe('fetchBytes', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('returns null when the size in metadata exceeds the cap', async () => {
+  it('returns null when the size in metadata exceeds the fetch cap', async () => {
     const { source, calls } = makeSource();
     const { session } = makeSession();
     const doc = fakeDoc('f1', 'file', {
       drive_item_id: 'f1',
       mime_type: 'application/pdf',
-      size_bytes: 26 * 1024 * 1024,
+      size_bytes: MAX_FETCH_BYTES + 1,
     });
 
     await expect(source.fetchBytes!(session, doc)).resolves.toBeNull();
@@ -143,7 +145,7 @@ describe('fetchBytes', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('the size cap is inclusive: size === cap still fetches; size === cap+1 returns null before any item GET', async () => {
+  it('the eager cap no longer limits fetchBytes; over the fetch cap returns null before any item GET', async () => {
     const { source, calls } = makeSource({
       items: {
         atcap: { id: 'atcap', name: 'exact.pdf', '@microsoft.graph.downloadUrl': 'https://download.example/atcap' },
@@ -163,11 +165,25 @@ describe('fetchBytes', () => {
     const overCapDoc = fakeDoc('overcap', 'file', {
       drive_item_id: 'overcap',
       mime_type: 'application/pdf',
-      size_bytes: MAX_BINARY_BYTES + 1,
+      size_bytes: MAX_FETCH_BYTES + 1,
     });
 
     await expect(source.fetchBytes!(session, overCapDoc)).resolves.toBeNull();
     expect(calls.some((u) => u.includes('/me/drive/items/overcap'))).toBe(false);
+  });
+
+  it('fetchBytes serves a deferred 60 MiB PDF and refuses a "none" one without any network call', async () => {
+    const { source, calls } = makeSource({
+      items: { big: { id: 'big', name: 'big.pdf', '@microsoft.graph.downloadUrl': 'https://download.example/big' } },
+      downloads: { 'https://download.example/big': new Uint8Array([7]) },
+    });
+    const { session } = makeSession();
+    const doc = (id: string, size: number) =>
+      fakeDoc(id, 'file', { drive_item_id: id, mime_type: 'application/pdf', filename: `${id}.pdf`, size_bytes: size });
+    expect(await source.fetchBytes!(session, doc('big', 60 * MiB))).toEqual(new Uint8Array([7]));
+    const before = calls.length;
+    expect(await source.fetchBytes!(session, doc('huge', MAX_FETCH_BYTES + 1))).toBeNull();
+    expect(calls.length).toBe(before);
   });
 
   it('returns null when the item is gone upstream (404/410)', async () => {
