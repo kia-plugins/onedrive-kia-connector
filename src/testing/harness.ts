@@ -332,6 +332,7 @@ export function fakeDoc(
     createdAt: null,
     contentHash: 'hash-x',
     seq: 1,
+    ingestSeq: 1,
     archivedAt: null,
     languages: [],
     ingestedAt: '2026-01-01T00:00:00Z',
