@@ -382,6 +382,18 @@ describe('ingest routing', () => {
     ).toEqual(['ok']);
   });
 
+  it('a .msg reported as octet-stream downloads and emits binary', async () => {
+    const { source, calls } = makeSource({
+      deltaPages: one('m1', 'Fwd.msg', { file: { mimeType: 'application/octet-stream' } }),
+      downloads: { 'https://download.example/m1': new Uint8Array([0xd0, 0xcf, 0x11, 0xe0]) },
+    });
+    const { session } = makeSession({ config: oneRoot });
+    const items = ((await collect(source.pull(session, null))) as B[]).flatMap((b) => b.items);
+    expect(items.map((i) => [i.file.id, i.extractionStatus])).toEqual([['m1', 'ok']]);
+    expect((source.toDocument(items[0]) as DocumentInput).binary?.filename).toBe('Fwd.msg');
+    expect(calls).toContain('https://download.example/m1');
+  });
+
   it('refreshes the downloadUrl when the delta payload omits it, then downloads successfully', async () => {
     const { source } = makeSource({
       deltaPages: {
