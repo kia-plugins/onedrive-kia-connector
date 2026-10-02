@@ -13,7 +13,7 @@ import {
   type OneDriveCursor,
   type OneDriveItem,
 } from '../source';
-import type { Batch, DocumentInput } from '@kiagent/connector-sdk';
+import { FILE_POLICY_VERSION, type Batch, type DocumentInput } from '@kiagent/connector-sdk';
 import {
   collect,
   deltaUrl,
@@ -168,6 +168,6 @@ describe('scope_roots is stamped on every persisted cursor', () => {
     )) as B[];
 
     expect(calls).toEqual([deltaUrl('FA')]);
-    expect(batches.at(-1)!.cursor).toEqual({ delta_tokens: { FA: 'TOK1' }, scope_roots: ['FA'] });
+    expect(batches.at(-1)!.cursor).toEqual({ delta_tokens: { FA: 'TOK1' }, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION });
   });
 });

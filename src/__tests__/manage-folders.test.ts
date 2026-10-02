@@ -19,11 +19,12 @@ import {
   type OneDriveCursor,
   type OneDriveItem,
 } from '../source';
-import type {
-  Batch,
-  DocumentInput,
-  FolderNode,
-  FolderScopeUpdate,
+import {
+  FILE_POLICY_VERSION,
+  type Batch,
+  type DocumentInput,
+  type FolderNode,
+  type FolderScopeUpdate,
 } from '@kiagent/connector-sdk';
 import {
   collect,
@@ -126,6 +127,22 @@ describe('manageFolders', () => {
     expect(source.descriptor.folderScope).toBe(true);
     expect(typeof source.manageFolders).toBe('function');
     expect(typeof source.reauthenticate).toBe('function');
+  });
+
+  it('carries the stored policy_version through a save (never stamps it), and leaves it absent when absent', async () => {
+    const { source } = makeSource();
+    const run = async (cursor: OneDriveCursor) => {
+      const { session } = makeSession({ config: { folderRoots: fr(['FB', 'Beta']) }, cursor });
+      const { channel } = makeFolderChannel({ picked: [node('FB', 'Beta')] });
+      return (await source.manageFolders!(session, channel)).cursor as OneDriveCursor;
+    };
+    expect(
+      await run({ delta_tokens: { FB: 'TB' }, scope_roots: ['FB'], policy_version: FILE_POLICY_VERSION }),
+    ).toEqual({ delta_tokens: { FB: 'TB' }, scope_roots: ['FB'], policy_version: FILE_POLICY_VERSION });
+    expect(await run({ delta_tokens: { FB: 'TB' }, scope_roots: ['FB'] })).toEqual({
+      delta_tokens: { FB: 'TB' },
+      scope_roots: ['FB'],
+    });
   });
 
   it('pre-selects the current roots, returns canonical folderRoots, and costs no SAVE-path Graph lookups on a pure ADD', async () => {
@@ -662,7 +679,7 @@ describe('invariant 15 — a newly added root does not override file-indexabilit
 
     const { session } = makeSession({
       config: { folderRoots: fr(['FB', 'Beta']) },
-      cursor: { delta_tokens: { FB: 'TB' }, scope_roots: ['FB'] } as OneDriveCursor,
+      cursor: { delta_tokens: { FB: 'TB' }, scope_roots: ['FB'], policy_version: FILE_POLICY_VERSION } as OneDriveCursor,
     });
     const { channel } = makeFolderChannel({ picked: [node('FB', 'Beta'), node('FG', 'Gamma')] });
 

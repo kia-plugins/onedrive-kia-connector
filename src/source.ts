@@ -95,7 +95,7 @@ import type {
   Session,
   Source,
 } from '@kiagent/connector-sdk';
-import { MAX_CLOUD_BINARY_BYTES, SourcePermanentError } from '@kiagent/connector-sdk';
+import { FILE_POLICY_VERSION, MAX_CLOUD_BINARY_BYTES, SourcePermanentError } from '@kiagent/connector-sdk';
 import {
   GRAPH_BASE,
   GraphApiError,
@@ -163,6 +163,11 @@ export interface OneDriveCursor {
   /** Present only while establishing a root (initial backfill, or a root
    *  added after the account went live) for the first time. */
   backfill?: { root_index: number; next_link?: string };
+  /** `FILE_POLICY_VERSION` this cursor's coverage was enumerated under. ABSENT
+   *  = 1. A stale value triggers one delta-from-scratch re-enumeration so
+   *  files the old policy ignored get rows (`pull`). Stamped by `pull`
+   *  only; `manageFolders` carries it through unchanged. */
+  policy_version?: number;
 }
 
 /** Subset of Microsoft Graph's driveItem consumed here. */
@@ -1168,18 +1173,57 @@ export function createOneDriveSource(
       const scopeRoots = roots.map((r) => r.rootFolderId);
       const start = normalizeCursor(cursor, roots);
       const processed = new Set<string>();
+      const fromVersion = cursor?.policy_version ?? 1;
+      const stale = cursor != null && fromVersion < FILE_POLICY_VERSION;
+      // ONE stamping site — scope_roots AND policy_version. There are SEVEN
+      // internal cursor literals across backfill()/establishRootLive()/
+      // pollRoot(); stamping each of them would make a single missed site
+      // look like a permanent scope mismatch, i.e. a token prune on every
+      // pull forever. Stamping the yielded batch instead is impossible to get
+      // partially wrong. (`manageFolders` is the other cursor writer: it
+      // carries policy_version, never stamps it.)
+      const stamp = async function* (
+        walk: AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>>,
+        version: number,
+      ): AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>> {
+        for await (const batch of walk) {
+          yield { ...batch, cursor: { ...batch.cursor, scope_roots: scopeRoots, policy_version: version } };
+        }
+      };
+      if (stale) {
+        // Catch up what the OLD tokens know (deletions above all — OneDrive
+        // has no reconcile, and a from-scratch enumeration never reports
+        // them), for every root that holds a token — even while another root
+        // is mid-backfill — then re-enumerate under the new policy. Each
+        // phase is resumable on its own: the catch-up keeps the old version
+        // (a crash replays it), the re-walk's backfill state carries the new.
+        const tokened = roots.filter((r) => typeof start?.delta_tokens?.[r.rootFolderId] === 'string');
+        if (start && tokened.length > 0) {
+          yield* stamp(
+            delta(
+              client,
+              session,
+              host.query,
+              host.net.fetch,
+              { delta_tokens: start.delta_tokens },
+              tokened,
+              processed,
+              budget,
+            ),
+            fromVersion,
+          );
+          processed.clear();
+        }
+        yield* stamp(
+          backfill(client, session, host.query, host.net.fetch, null, roots, processed, budget),
+          FILE_POLICY_VERSION,
+        );
+        return;
+      }
       const walk = !backfillDone(start, roots)
         ? backfill(client, session, host.query, host.net.fetch, start, roots, processed, budget)
         : delta(client, session, host.query, host.net.fetch, start!, roots, processed, budget);
-      // ONE stamping site. There are SEVEN internal cursor literals across
-      // backfill()/establishRootLive()/pollRoot() (`src/source.ts:595`,
-      // `:621`, `:634`, `:635`, `:638`, `:666`, `:698`); stamping each of
-      // them would make a single missed site look like a permanent scope
-      // mismatch, i.e. a token prune on every pull forever. Stamping the
-      // yielded batch instead is impossible to get partially wrong.
-      for await (const batch of walk) {
-        yield { ...batch, cursor: { ...batch.cursor, scope_roots: scopeRoots } };
-      }
+      yield* stamp(walk, FILE_POLICY_VERSION);
     },
 
     toDocument(item: OneDriveItem): DocumentInput {
@@ -1397,7 +1441,13 @@ export function createOneDriveSource(
       // `delta_tokens` leak is closed here and in `normalizeCursor`, nowhere
       // else. NO `backfill` key, ever: a stale root_index/next_link pair
       // would resume paging the wrong root (A5c).
-      const cursor: OneDriveCursor = { delta_tokens, scope_roots: [...nextIds] };
+      // policy_version is CARRIED, never stamped: stamping the current one
+      // would skip the one-time re-enumeration for roots retained here.
+      const cursor: OneDriveCursor = {
+        delta_tokens,
+        scope_roots: [...nextIds],
+        ...(prev?.policy_version !== undefined ? { policy_version: prev.policy_version } : {}),
+      };
 
       // A-3 / R5. `archiveNullScoped` asks core to archive this account's live
       // rows whose `scope_root_id` is NULL — rows core's v3 migration could

@@ -4,7 +4,7 @@
  * pages, and the 410 resyncRequired re-prime.
  */
 import { createOneDriveSource, GRAPH_BASE, type OneDriveCursor, type OneDriveItem } from '../source';
-import type { Batch } from '@kiagent/connector-sdk';
+import { FILE_POLICY_VERSION, type Batch } from '@kiagent/connector-sdk';
 import {
   collect,
   deletedItem,
@@ -41,7 +41,7 @@ describe('delta', () => {
       downloads: { 'https://download.example/f1': new Uint8Array([1]) },
     });
     const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
-    const cursor: OneDriveCursor = { delta_tokens: { FA: 'OLD_TOKEN' } };
+    const cursor: OneDriveCursor = { delta_tokens: { FA: 'OLD_TOKEN' }, policy_version: FILE_POLICY_VERSION };
 
     const batches = (await collect(source.pull(session, cursor))) as B[];
 
@@ -49,7 +49,7 @@ describe('delta', () => {
     expect(batches).toHaveLength(1);
     expect(batches[0].phase).toBe('live');
     expect(ids(batches[0])).toEqual(['f1']);
-    expect(batches[0].cursor).toEqual({ delta_tokens: { FA: 'NEW_TOKEN' }, scope_roots: ['FA'] });
+    expect(batches[0].cursor).toEqual({ delta_tokens: { FA: 'NEW_TOKEN' }, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION });
   });
 
   it('follows @odata.nextLink across poll pages and saves the final token', async () => {
@@ -69,13 +69,13 @@ describe('delta', () => {
       },
     });
     const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
-    const cursor: OneDriveCursor = { delta_tokens: { FA: 'OLD_TOKEN' } };
+    const cursor: OneDriveCursor = { delta_tokens: { FA: 'OLD_TOKEN' }, policy_version: FILE_POLICY_VERSION };
 
     const batches = (await collect(source.pull(session, cursor))) as B[];
 
     expect(batches).toHaveLength(2);
     expect(batches.flatMap(ids)).toEqual(['f1', 'f2']);
-    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'NEW_TOKEN' }, scope_roots: ['FA'] });
+    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'NEW_TOKEN' }, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION });
   });
 
   it('deletes: a removed item with an existing doc is surfaced via Batch.deletions', async () => {
@@ -93,7 +93,7 @@ describe('delta', () => {
       query,
     );
     const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
-    const cursor: OneDriveCursor = { delta_tokens: { FA: 'T' } };
+    const cursor: OneDriveCursor = { delta_tokens: { FA: 'T' }, policy_version: FILE_POLICY_VERSION };
 
     const batches = (await collect(source.pull(session, cursor))) as B[];
 
@@ -116,7 +116,7 @@ describe('delta', () => {
       query,
     );
     const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
-    const cursor: OneDriveCursor = { delta_tokens: { FA: 'T' } };
+    const cursor: OneDriveCursor = { delta_tokens: { FA: 'T' }, policy_version: FILE_POLICY_VERSION };
 
     const batches = (await collect(source.pull(session, cursor))) as B[];
 
@@ -141,7 +141,7 @@ describe('delta', () => {
       query,
     );
     const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
-    const cursor: OneDriveCursor = { delta_tokens: { FA: 'T' } };
+    const cursor: OneDriveCursor = { delta_tokens: { FA: 'T' }, policy_version: FILE_POLICY_VERSION };
 
     const batches = (await collect(source.pull(session, cursor))) as B[];
 
@@ -161,7 +161,7 @@ describe('delta', () => {
       },
     });
     const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
-    const cursor: OneDriveCursor = { delta_tokens: { FA: 'T' } };
+    const cursor: OneDriveCursor = { delta_tokens: { FA: 'T' }, policy_version: FILE_POLICY_VERSION };
 
     const batches = (await collect(source.pull(session, cursor))) as B[];
 
@@ -197,12 +197,12 @@ describe('delta', () => {
       },
     });
     const { session, logs } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
-    const cursor: OneDriveCursor = { delta_tokens: { FA: 'STALE' } };
+    const cursor: OneDriveCursor = { delta_tokens: { FA: 'STALE' }, policy_version: FILE_POLICY_VERSION };
 
     const batches = (await collect(source.pull(session, cursor))) as B[];
 
     expect(calls).toEqual([staleUrl, repriming]);
-    expect(batches[batches.length - 1].cursor).toEqual({ delta_tokens: { FA: 'REPRIMED' }, scope_roots: ['FA'] });
+    expect(batches[batches.length - 1].cursor).toEqual({ delta_tokens: { FA: 'REPRIMED' }, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION });
     expect(logs.some((l) => l.level === 'warn' && /token invalid for root FA/.test(l.msg))).toBe(true);
   });
 
@@ -212,7 +212,7 @@ describe('delta', () => {
       deltaPages: { [pollUrl]: jsonRes(400, { error: { message: 'Bad Request' } }) },
     });
     const { session } = makeSession({ config: { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] } });
-    const cursor: OneDriveCursor = { delta_tokens: { FA: 'T' } };
+    const cursor: OneDriveCursor = { delta_tokens: { FA: 'T' }, policy_version: FILE_POLICY_VERSION };
 
     await expect(collect(source.pull(session, cursor))).rejects.toThrow(/^graph 400 /);
   });
@@ -243,12 +243,109 @@ describe('delta', () => {
         ],
       },
     });
-    const cursor: OneDriveCursor = { delta_tokens: { FA: 'STALE', FB: 'OK_TOKEN' } };
+    const cursor: OneDriveCursor = { delta_tokens: { FA: 'STALE', FB: 'OK_TOKEN' }, policy_version: FILE_POLICY_VERSION };
 
     const batches = (await collect(source.pull(session, cursor))) as B[];
 
     expect(batches.flatMap(ids)).toEqual(['b1']);
     const last = batches[batches.length - 1];
-    expect(last.cursor).toEqual({ delta_tokens: { FA: 'REPRIMED', FB: 'NEW_B' }, scope_roots: ['FA', 'FB'] });
+    expect(last.cursor).toEqual({ delta_tokens: { FA: 'REPRIMED', FB: 'NEW_B' }, scope_roots: ['FA', 'FB'], policy_version: FILE_POLICY_VERSION });
+  });
+});
+
+describe('policy_version re-enumeration', () => {
+  const oneRoot = { roots: [{ rootFolderId: 'FA', rootName: 'Alpha' }] };
+  const finalLink = (root: string, token: string) => `${GRAPH_BASE}/me/drive/items/${root}/delta?token=${token}`;
+
+  it('an old cursor without policy_version catches up deletions, then re-enumerates from scratch once', async () => {
+    const query = fakeQuery([
+      fakeDoc('gone', 'file', { etag: 'e', extraction_status: 'ok' }),
+      fakeDoc('kept', 'file', { etag: 'etag-kept-1', extraction_status: 'ok' }),
+    ]);
+    const { source, calls } = makeSource(
+      {
+        deltaPages: {
+          // old token: reports the deletion
+          [deltaUrl('FA', 'OLD')]: {
+            value: [deletedItem('gone')],
+            '@odata.deltaLink': finalLink('FA', 'OLD2'),
+          },
+          // from scratch: an already-indexed file (hash-skipped) + a 60 MiB PDF the old policy ignored
+          [deltaUrl('FA')]: {
+            value: [driveFile('kept', 'k.pdf'), driveFile('big', 'big.pdf', { size: 60 * 1024 * 1024 })],
+            '@odata.deltaLink': finalLink('FA', 'NEW'),
+          },
+        },
+      },
+      query,
+    );
+    const { session } = makeSession({ config: oneRoot });
+    const old: OneDriveCursor = { delta_tokens: { FA: 'OLD' }, scope_roots: ['FA'] };
+
+    const batches = (await collect(source.pull(session, old))) as B[];
+
+    expect(batches.flatMap((b) => b.deletions ?? [])).toEqual([{ externalId: 'gone', type: 'file' }]);
+    expect(batches.flatMap(ids)).toEqual(['big']);
+    expect(calls.some((u) => u.includes('download.example'))).toBe(false);
+    expect(batches.at(-1)!.cursor).toEqual({
+      delta_tokens: { FA: 'NEW' },
+      scope_roots: ['FA'],
+      policy_version: FILE_POLICY_VERSION,
+    });
+    // the catch-up batch carries the old version: a crash there replays the catch-up
+    expect(batches[0].cursor.policy_version).toBe(1);
+  });
+
+  it('a partially backfilled old cursor still drains the tokens it has before re-enumerating', async () => {
+    const twoRoots = {
+      roots: [
+        { rootFolderId: 'FA', rootName: 'Alpha' },
+        { rootFolderId: 'FB', rootName: 'Beta' },
+      ],
+    };
+    const query = fakeQuery([fakeDoc('gone', 'file', { etag: 'e', extraction_status: 'ok' })]);
+    const { source } = makeSource(
+      {
+        deltaPages: {
+          [deltaUrl('FA', 'OLD')]: { value: [deletedItem('gone')], '@odata.deltaLink': finalLink('FA', 'OLD2') },
+          [deltaUrl('FA')]: { value: [], '@odata.deltaLink': finalLink('FA', 'NA') },
+          [deltaUrl('FB')]: { value: [], '@odata.deltaLink': finalLink('FB', 'NB') },
+        },
+      },
+      query,
+    );
+    const { session } = makeSession({ config: twoRoots });
+    const old: OneDriveCursor = { delta_tokens: { FA: 'OLD' }, scope_roots: ['FA', 'FB'], backfill: { root_index: 1 } };
+    const batches = (await collect(source.pull(session, old))) as B[];
+    expect(batches.flatMap((b) => b.deletions ?? [])).toEqual([{ externalId: 'gone', type: 'file' }]);
+    expect(batches.at(-1)!.cursor.policy_version).toBe(FILE_POLICY_VERSION);
+  });
+
+  it('a current cursor polls delta normally (no re-enumeration)', async () => {
+    const { source, calls } = makeSource({
+      deltaPages: { [deltaUrl('FA', 'T')]: { value: [], '@odata.deltaLink': finalLink('FA', 'T2') } },
+    });
+    const { session } = makeSession({ config: oneRoot });
+    await collect(
+      source.pull(session, { delta_tokens: { FA: 'T' }, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION }),
+    );
+    expect(calls.some((u) => u === deltaUrl('FA'))).toBe(false);
+  });
+
+  it('a crash mid re-enumeration resumes the backfill, not the catch-up', async () => {
+    const page2 = `${GRAPH_BASE}/me/drive/items/FA/delta?$skiptoken=p2`;
+    // cursor as stamped by a backfill batch of the re-walk
+    const mid: OneDriveCursor = {
+      delta_tokens: {},
+      scope_roots: ['FA'],
+      policy_version: FILE_POLICY_VERSION,
+      backfill: { root_index: 0, next_link: page2 },
+    };
+    const { source, calls } = makeSource({
+      deltaPages: { [page2]: { value: [], '@odata.deltaLink': finalLink('FA', 'NEW') } },
+    });
+    const { session } = makeSession({ config: oneRoot });
+    await collect(source.pull(session, mid));
+    expect(calls.filter((u) => u.includes('/delta'))).toEqual([page2]);
   });
 });

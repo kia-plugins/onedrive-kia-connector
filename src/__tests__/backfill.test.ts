@@ -7,7 +7,7 @@
  */
 import { createOneDriveSource, GRAPH_BASE, type OneDriveCursor, type OneDriveItem } from '../source';
 import { OneDriveAuthError } from '../client';
-import type { Batch } from '@kiagent/connector-sdk';
+import { FILE_POLICY_VERSION, type Batch } from '@kiagent/connector-sdk';
 import {
   collect,
   deltaUrl,
@@ -57,9 +57,10 @@ describe('backfill', () => {
     expect(batches[0].cursor).toEqual({
       delta_tokens: {},
       scope_roots: ['FA'],
+      policy_version: FILE_POLICY_VERSION,
       backfill: { root_index: 0, next_link: page2 },
     });
-    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'TOK1' }, scope_roots: ['FA'] });
+    expect(batches[1].cursor).toEqual({ delta_tokens: { FA: 'TOK1' }, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION });
     expect(ids(batches[0])).toEqual(['f1']);
     expect(ids(batches[1])).toEqual(['f2']);
     expect(batches[0].items[0]).toMatchObject({
@@ -90,13 +91,14 @@ describe('backfill', () => {
     const cursor: OneDriveCursor = {
       delta_tokens: {},
       scope_roots: ['FA'],
+      policy_version: FILE_POLICY_VERSION,
       backfill: { root_index: 0, next_link: page2 },
     };
     const batches = (await collect(source.pull(session, cursor))) as B[];
 
     expect(calls[0]).toBe(page2);
     expect(calls.some((u) => u === deltaUrl('FA'))).toBe(false);
-    expect(batches[batches.length - 1].cursor).toEqual({ delta_tokens: { FA: 'TOK1' }, scope_roots: ['FA'] });
+    expect(batches[batches.length - 1].cursor).toEqual({ delta_tokens: { FA: 'TOK1' }, scope_roots: ['FA'], policy_version: FILE_POLICY_VERSION });
   });
 
   it('multi-root: phase stays backfill until the LAST root reaches its deltaLink', async () => {
@@ -131,11 +133,13 @@ describe('backfill', () => {
     expect(batches[0].cursor).toEqual({
       delta_tokens: { FA: 'TOK_A' },
       scope_roots: ['FA', 'FB'],
+      policy_version: FILE_POLICY_VERSION,
       backfill: { root_index: 1 },
     });
     expect(batches[1].cursor).toEqual({
       delta_tokens: { FA: 'TOK_A', FB: 'TOK_B' },
       scope_roots: ['FA', 'FB'],
+      policy_version: FILE_POLICY_VERSION,
     });
     expect(ids(batches[0])).toEqual(['a1']);
     expect(ids(batches[1])).toEqual(['b1']);
