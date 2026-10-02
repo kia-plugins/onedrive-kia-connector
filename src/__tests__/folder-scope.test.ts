@@ -100,6 +100,11 @@ describe('scopeRootId', () => {
 });
 
 describe('normalizeCursor', () => {
+  it('a re-walk in progress survives a scope change, restarted from the first root', () => {
+    const c: OneDriveCursor = { delta_tokens: { FA: 'TA' }, scope_roots: ['FA'], rewalk: { root_index: 1, next_link: 'x' } };
+    expect(normalizeCursor(c, R('FA', 'FB'))).toEqual({ delta_tokens: { FA: 'TA' }, scope_roots: ['FA', 'FB'], rewalk: { root_index: 0 } });
+  });
+
   it('a matching scope rides through UNTOUCHED — order-independent, backfill resume preserved', () => {
     const c: OneDriveCursor = {
       delta_tokens: { FA: 'TA', FB: 'TB' },

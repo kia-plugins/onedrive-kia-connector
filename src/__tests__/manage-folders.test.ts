@@ -145,6 +145,22 @@ describe('manageFolders', () => {
     });
   });
 
+  it('a save mid re-walk keeps the re-walk, restarted over the new root list', async () => {
+    const { source } = makeSource();
+    const { session } = makeSession({
+      config: { folderRoots: fr(['FB', 'Beta']) },
+      cursor: {
+        delta_tokens: { FB: 'TB' },
+        scope_roots: ['FB'],
+        policy_version: FILE_POLICY_VERSION,
+        rewalk: { root_index: 0, next_link: 'x' },
+      } as OneDriveCursor,
+    });
+    const { channel } = makeFolderChannel({ picked: [node('FB', 'Beta')] });
+    const out = (await source.manageFolders!(session, channel)).cursor as OneDriveCursor;
+    expect(out.rewalk).toEqual({ root_index: 0 });
+  });
+
   it('pre-selects the current roots, returns canonical folderRoots, and costs no SAVE-path Graph lookups on a pure ADD', async () => {
     const { source, calls } = makeSource();
     const { session } = makeSession({

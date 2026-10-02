@@ -168,6 +168,12 @@ export interface OneDriveCursor {
    *  files the old policy ignored get rows (`pull`). Stamped by `pull`
    *  only; `manageFolders` carries it through unchanged. */
   policy_version?: number;
+  /** Progress of that re-enumeration (same shape as `backfill`). While it is
+   *  present `delta_tokens` still holds the PRE-re-walk tokens: they are
+   *  polled once the re-walk ends, so every deletion since then — including
+   *  ones made while the app was closed mid-re-walk — is still reported
+   *  (OneDrive has no reconcile pass to catch them otherwise). */
+  rewalk?: { root_index: number; next_link?: string };
 }
 
 /** Subset of Microsoft Graph's driveItem consumed here. */
@@ -689,7 +695,8 @@ export function normalizeCursor(
     const token = cursor.delta_tokens?.[id];
     if (typeof token === 'string') delta_tokens[id] = token;
   }
-  return { delta_tokens, scope_roots: configured };
+  // A re-walk in progress restarts: its root_index named the old root list.
+  return { delta_tokens, scope_roots: configured, ...(cursor.rewalk ? { rewalk: { root_index: 0 } } : {}) };
 }
 
 function backfillDone(cursor: OneDriveCursor | null, roots: RootConfig[]): boolean {
@@ -1184,46 +1191,39 @@ export function createOneDriveSource(
       // carries policy_version, never stamps it.)
       const stamp = async function* (
         walk: AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>>,
-        version: number,
       ): AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>> {
         for await (const batch of walk) {
-          yield { ...batch, cursor: { ...batch.cursor, scope_roots: scopeRoots, policy_version: version } };
+          yield { ...batch, cursor: { ...batch.cursor, scope_roots: scopeRoots, policy_version: FILE_POLICY_VERSION } };
         }
       };
-      if (stale) {
-        // Catch up what the OLD tokens know (deletions above all — OneDrive
-        // has no reconcile, and a from-scratch enumeration never reports
-        // them), for every root that holds a token — even while another root
-        // is mid-backfill — then re-enumerate under the new policy. Each
-        // phase is resumable on its own: the catch-up keeps the old version
-        // (a crash replays it), the re-walk's backfill state carries the new.
-        const tokened = roots.filter((r) => typeof start?.delta_tokens?.[r.rootFolderId] === 'string');
-        if (start && tokened.length > 0) {
-          yield* stamp(
-            delta(
-              client,
-              session,
-              host.query,
-              host.net.fetch,
-              { delta_tokens: start.delta_tokens },
-              tokened,
-              processed,
-              budget,
-            ),
-            fromVersion,
-          );
-          processed.clear();
-        }
-        yield* stamp(
-          backfill(client, session, host.query, host.net.fetch, null, roots, processed, budget),
-          FILE_POLICY_VERSION,
-        );
+      const rewalkFrom = start && stale ? { root_index: 0 } : start?.rewalk;
+      if (start && rewalkFrom) {
+        // Re-enumerate every root from scratch under the new policy, but KEEP
+        // the pre-re-walk delta tokens (the walk's own tokens only fill roots
+        // that had none), then poll them: deletions — above all — since those
+        // tokens are reported whatever happened during the re-walk, crashes
+        // and days-long gaps included. Unchanged files the poll re-reports
+        // are hash-skipped.
+        const kept = start.delta_tokens;
+        let tokens: Record<string, string> = { ...kept };
+        const rewalk = async function* (): AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>> {
+          const walk = backfill(client, session, host.query, host.net.fetch, { delta_tokens: {}, backfill: rewalkFrom }, roots, processed, budget);
+          for await (const batch of walk) {
+            tokens = { ...batch.cursor.delta_tokens, ...kept };
+            const progress = batch.cursor.backfill;
+            yield { ...batch, cursor: { delta_tokens: tokens, ...(progress ? { rewalk: progress } : {}) } };
+          }
+        };
+        yield* stamp(rewalk());
+        if (session.signal.aborted || !backfillDone({ delta_tokens: tokens }, roots)) return;
+        processed.clear();
+        yield* stamp(delta(client, session, host.query, host.net.fetch, { delta_tokens: tokens }, roots, processed, budget));
         return;
       }
       const walk = !backfillDone(start, roots)
         ? backfill(client, session, host.query, host.net.fetch, start, roots, processed, budget)
         : delta(client, session, host.query, host.net.fetch, start!, roots, processed, budget);
-      yield* stamp(walk, FILE_POLICY_VERSION);
+      yield* stamp(walk);
     },
 
     toDocument(item: OneDriveItem): DocumentInput {
@@ -1447,6 +1447,8 @@ export function createOneDriveSource(
         delta_tokens,
         scope_roots: [...nextIds],
         ...(prev?.policy_version !== undefined ? { policy_version: prev.policy_version } : {}),
+        // An unfinished re-walk restarts over the new root list.
+        ...(prev?.rewalk ? { rewalk: { root_index: 0 } } : {}),
       };
 
       // A-3 / R5. `archiveNullScoped` asks core to archive this account's live
