@@ -51,3 +51,11 @@ describe('buildDisplayPath', () => {
     expect(buildDisplayPath(root, item)).toBe('Shared / no-parent.txt');
   });
 });
+
+describe('buildDisplayPath with a malformed percent-escape', () => {
+  it('keeps the raw segment instead of throwing URIError', () => {
+    const root = { rootName: 'My files' };
+    const item = { name: 'plan.pdf', parentReference: { path: '/drive/root:/100% Rabatt/My%20Docs' } };
+    expect(buildDisplayPath(root, item)).toBe('My files / 100% Rabatt / My Docs / plan.pdf');
+  });
+});

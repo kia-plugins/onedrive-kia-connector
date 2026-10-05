@@ -600,6 +600,24 @@ function isResyncRequired(msg: string): boolean {
   return /410/.test(msg) && /(resyncRequired|invalidToken|syncStateNotFound)/i.test(msg);
 }
 
+/** A tracked root that was deleted upstream, or that the user lost access
+ *  to, answers its /delta feed with 404 itemNotFound. That is one root's
+ *  problem: it is skipped (and re-probed next pull), never allowed to fail
+ *  the whole pull — which would stall every other root and, during a policy
+ *  re-walk, keep the re-walk from ever completing. Its indexed rows stay
+ *  until the user removes the folder under Manage folders. */
+function isRootGone(e: unknown): boolean {
+  return e instanceof GraphApiError && e.status === 404;
+}
+
+function skipGoneRoot(session: Session, root: RootConfig, gone: Set<string>): void {
+  gone.add(root.rootFolderId);
+  session.log(
+    'warn',
+    `onedrive: tracked folder "${root.rootName}" (${root.rootFolderId}) no longer exists in OneDrive — skipped; remove it under Manage folders`,
+  );
+}
+
 interface WalkStep {
   items: OneDriveItem[];
   deletions: ExternalRef[];
@@ -722,6 +740,7 @@ async function* backfill(
   roots: RootConfig[],
   processed: Set<string>,
   budget: BatchBudget,
+  gone: Set<string>,
 ): AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>> {
   const deps: ItemDeps = { client, session, query, fetchFn, processed, budget, ignored: new IgnoreTally() };
   if (roots.length === 0) {
@@ -756,24 +775,37 @@ async function* backfill(
       backfill: resuming ? { root_index: i, next_link: resumeNextLink } : { root_index: i },
     };
 
-    for await (const step of walkRootToDeltaLink(client, root, deps, startUrl, false)) {
-      if (session.signal.aborted) return;
-      if (!step.pageComplete) {
-        yield { phase: 'backfill', items: step.items, deletions: step.deletions, cursor: pageCursor };
-      } else if (step.token != null) {
-        deltaTokens[root.rootFolderId] = step.token;
-        const more = i + 1 < roots.length;
-        const nextCursor: OneDriveCursor = more
-          ? { delta_tokens: { ...deltaTokens }, backfill: { root_index: i + 1 } }
-          : { delta_tokens: { ...deltaTokens } };
-        yield { phase: more ? 'backfill' : 'live', items: step.items, deletions: step.deletions, cursor: nextCursor };
-      } else {
-        pageCursor = {
-          delta_tokens: { ...deltaTokens },
-          backfill: { root_index: i, next_link: step.nextLink },
-        };
-        yield { phase: 'backfill', items: step.items, deletions: step.deletions, cursor: pageCursor };
+    // A marker only when a LATER root still needs establishing: a marker
+    // past only token-holding roots resumes into a no-op walk that yields
+    // nothing — the cursor would never move again, and an earlier tokenless
+    // (gone) root would never be re-probed.
+    const more = roots.slice(i + 1).some((r) => deltaTokens[r.rootFolderId] == null);
+    const doneCursor = (): OneDriveCursor =>
+      more
+        ? { delta_tokens: { ...deltaTokens }, backfill: { root_index: i + 1 } }
+        : { delta_tokens: { ...deltaTokens } };
+    try {
+      for await (const step of walkRootToDeltaLink(client, root, deps, startUrl, false)) {
+        if (session.signal.aborted) return;
+        if (!step.pageComplete) {
+          yield { phase: 'backfill', items: step.items, deletions: step.deletions, cursor: pageCursor };
+        } else if (step.token != null) {
+          deltaTokens[root.rootFolderId] = step.token;
+          yield { phase: more ? 'backfill' : 'live', items: step.items, deletions: step.deletions, cursor: doneCursor() };
+        } else {
+          pageCursor = {
+            delta_tokens: { ...deltaTokens },
+            backfill: { root_index: i, next_link: step.nextLink },
+          };
+          yield { phase: 'backfill', items: step.items, deletions: step.deletions, cursor: pageCursor };
+        }
       }
+    } catch (e) {
+      if (!isRootGone(e)) throw e;
+      skipGoneRoot(session, root, gone);
+      // Advance past it, tokenless: backfillDone stays false for it, so the
+      // next pull re-probes it — and pull() polls the live roots meanwhile.
+      yield { phase: more ? 'backfill' : 'live', items: [], cursor: doneCursor() };
     }
   }
   deps.ignored.logIfAny(session);
@@ -851,6 +883,7 @@ async function* delta(
   roots: RootConfig[],
   processed: Set<string>,
   budget: BatchBudget,
+  gone: Set<string>,
 ): AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>> {
   const deps: ItemDeps = { client, session, query, fetchFn, processed, budget, ignored: new IgnoreTally() };
   const deltaTokens: Record<string, string> = { ...cursor.delta_tokens };
@@ -868,12 +901,21 @@ async function* delta(
       yield* pollRoot(client, root, deps, startUrl, deltaTokens);
     } catch (e) {
       if (isAuthError(e)) throw e;
+      if (isRootGone(e)) {
+        skipGoneRoot(session, root, gone);
+        continue;
+      }
       if (!isResyncRequired(errText(e))) throw e;
       session.log(
         'warn',
         `onedrive delta: token invalid for root ${root.rootFolderId} (${errText(e)}) — re-priming`,
       );
-      yield* establishRootLive(client, root, deps, deltaTokens);
+      try {
+        yield* establishRootLive(client, root, deps, deltaTokens);
+      } catch (e2) {
+        if (!isRootGone(e2)) throw e2;
+        skipGoneRoot(session, root, gone);
+      }
     }
   }
   deps.ignored.logIfAny(session);
@@ -1196,6 +1238,9 @@ export function createOneDriveSource(
           yield { ...batch, cursor: { ...batch.cursor, scope_roots: scopeRoots, policy_version: FILE_POLICY_VERSION } };
         }
       };
+      // Roots found gone upstream during THIS pull (see isRootGone).
+      const gone = new Set<string>();
+      const liveRoots = () => roots.filter((r) => !gone.has(r.rootFolderId));
       const rewalkFrom = start && stale ? { root_index: 0 } : start?.rewalk;
       if (start && rewalkFrom) {
         // Re-enumerate every root from scratch under the new policy, but KEEP
@@ -1207,7 +1252,7 @@ export function createOneDriveSource(
         const kept = start.delta_tokens;
         let tokens: Record<string, string> = { ...kept };
         const rewalk = async function* (): AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>> {
-          const walk = backfill(client, session, host.query, host.net.fetch, { delta_tokens: {}, backfill: rewalkFrom }, roots, processed, budget);
+          const walk = backfill(client, session, host.query, host.net.fetch, { delta_tokens: {}, backfill: rewalkFrom }, roots, processed, budget, gone);
           for await (const batch of walk) {
             tokens = { ...batch.cursor.delta_tokens, ...kept };
             const progress = batch.cursor.backfill;
@@ -1217,16 +1262,31 @@ export function createOneDriveSource(
         yield* stamp(rewalk());
         // Only the kept tokens need the poll: a root that had none just got a
         // fresh token from the re-walk itself.
-        const keptRoots = roots.filter((r) => typeof kept[r.rootFolderId] === 'string');
-        if (session.signal.aborted || !backfillDone({ delta_tokens: tokens }, roots) || keptRoots.length === 0) return;
+        const keptRoots = liveRoots().filter((r) => typeof kept[r.rootFolderId] === 'string');
+        if (session.signal.aborted || !backfillDone({ delta_tokens: tokens }, liveRoots()) || keptRoots.length === 0) return;
         processed.clear();
-        yield* stamp(delta(client, session, host.query, host.net.fetch, { delta_tokens: tokens }, keptRoots, processed, budget));
+        yield* stamp(delta(client, session, host.query, host.net.fetch, { delta_tokens: tokens }, keptRoots, processed, budget, gone));
         return;
       }
-      const walk = !backfillDone(start, roots)
-        ? backfill(client, session, host.query, host.net.fetch, start, roots, processed, budget)
-        : delta(client, session, host.query, host.net.fetch, start!, roots, processed, budget);
-      yield* stamp(walk);
+      if (backfillDone(start, roots)) {
+        yield* stamp(delta(client, session, host.query, host.net.fetch, start!, roots, processed, budget, gone));
+        return;
+      }
+      let last = start;
+      for await (const batch of stamp(backfill(client, session, host.query, host.net.fetch, start, roots, processed, budget, gone))) {
+        last = batch.cursor;
+        yield batch;
+      }
+      // A gone root stays tokenless, so every pull lands in backfill(); the
+      // roots that were already established must still be polled here or
+      // they never would be. backfill() ran to the end, so a leftover
+      // `backfill` marker in its last cursor is moot — judge by tokens.
+      if (session.signal.aborted || gone.size === 0) return;
+      const tokens = { ...last?.delta_tokens };
+      const polled = liveRoots().filter((r) => typeof start?.delta_tokens[r.rootFolderId] === 'string');
+      if (!backfillDone({ delta_tokens: tokens }, liveRoots()) || polled.length === 0) return;
+      processed.clear();
+      yield* stamp(delta(client, session, host.query, host.net.fetch, { delta_tokens: tokens }, polled, processed, budget, gone));
     },
 
     toDocument(item: OneDriveItem): DocumentInput {

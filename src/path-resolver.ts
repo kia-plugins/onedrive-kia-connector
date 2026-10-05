@@ -29,8 +29,20 @@ export function buildDisplayPath(root: DisplayPathRoot, item: DisplayPathItem): 
   const raw = item.parentReference?.path;
   if (!raw) return `${root.rootName} / ${item.name}`;
   const stripped = raw.replace(/^\/drive\/root:?/, '');
-  const segments = decodeURIComponent(stripped)
+  const segments = stripped
     .split('/')
-    .filter((s) => s.length > 0);
+    .filter((s) => s.length > 0)
+    .map(decodeSegment);
   return [root.rootName, ...segments, item.name].join(' / ');
+}
+
+/** Graph does not always percent-encode a literal `%` in a folder name
+ *  (`/100% Rabatt`), and one such segment must not cost the item its row —
+ *  it keeps its raw spelling instead. */
+function decodeSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
 }
