@@ -21,15 +21,18 @@
  */
 import type { FolderCount, FolderNode } from '@kiagent/connector-sdk';
 import { GRAPH_BASE, type GraphClient } from './client';
+import { itemUrl, listedRef, type MaybeRemote } from './item-ref';
 
 /** Picker listing page size (v1's `$top=200`). */
 const PICKER_TOP = 200;
-const PICKER_SELECT = '$select=id,name,folder,parentReference,childCount';
+// `remoteItem` must be selected explicitly: it carries the owner's drive id
+// for a shared folder / shortcut (item-ref.ts).
+const PICKER_SELECT = '$select=id,name,folder,parentReference,childCount,remoteItem';
 
-interface GraphChildItem {
-  id: string;
-  name: string;
+interface GraphChildItem extends MaybeRemote {
+  name?: string;
   folder?: { childCount?: number };
+  remoteItem?: MaybeRemote['remoteItem'] & { name?: string; folder?: { childCount?: number } };
 }
 
 interface GraphChildPage {
@@ -37,14 +40,24 @@ interface GraphChildPage {
   '@odata.nextLink'?: string;
 }
 
-async function listFolderNodes(client: GraphClient, startUrl: string): Promise<FolderNode[]> {
+/** `parentId` null = a listing with no parent folder ("Shared with me"). */
+async function listFolderNodes(
+  client: GraphClient,
+  startUrl: string,
+  parentId: string | null,
+): Promise<FolderNode[]> {
   const nodes: FolderNode[] = [];
   let url: string | undefined = startUrl;
   while (url) {
     const page: GraphChildPage = await client.request<GraphChildPage>(url);
     for (const it of page.value ?? []) {
-      if (!it.folder) continue; // files aren't shown in the picker (v1 parity)
-      nodes.push({ id: it.id, name: it.name, hasChildren: (it.folder.childCount ?? 0) > 0 });
+      // A shared folder / shortcut carries its folder facet on `remoteItem`.
+      const folder = it.folder ?? it.remoteItem?.folder;
+      if (!folder) continue; // files aren't shown in the picker (v1 parity)
+      // A shortcut's own (possibly renamed) name wins; a sharedWithMe entry
+      // may carry its name only on `remoteItem`.
+      const name = it.name ?? it.remoteItem?.name ?? it.id;
+      nodes.push({ id: listedRef(parentId, it), name, hasChildren: (folder.childCount ?? 0) > 0 });
     }
     url = page['@odata.nextLink'];
   }
@@ -53,14 +66,12 @@ async function listFolderNodes(client: GraphClient, startUrl: string): Promise<F
 
 /** Roots of the picker's "Shared with me" tab. */
 export const listSharedRoots = (client: GraphClient): Promise<FolderNode[]> =>
-  listFolderNodes(client, `${GRAPH_BASE}/me/drive/sharedWithMe?${PICKER_SELECT}&$top=${PICKER_TOP}`);
+  listFolderNodes(client, `${GRAPH_BASE}/me/drive/sharedWithMe?${PICKER_SELECT}&$top=${PICKER_TOP}`, null);
 
-/** Child FOLDERS of one picker row (`root` is Graph's My-Files alias). */
+/** Child FOLDERS of one picker row (`root` is Graph's My-Files alias; a
+ *  shared row's id is drive-qualified, and so are its children's). */
 export const listChildFolders = (client: GraphClient, id: string): Promise<FolderNode[]> =>
-  listFolderNodes(
-    client,
-    `${GRAPH_BASE}/me/drive/items/${encodeURIComponent(id)}/children?${PICKER_SELECT}&$top=${PICKER_TOP}`,
-  );
+  listFolderNodes(client, `${itemUrl(id)}/children?${PICKER_SELECT}&$top=${PICKER_TOP}`, id);
 
 /**
  * Per-row file count for the picker. v1 surfaced Graph's `folder.childCount`
@@ -75,7 +86,7 @@ export const listChildFolders = (client: GraphClient, id: string): Promise<Folde
 export async function countChildren(client: GraphClient, id: string): Promise<FolderCount | null> {
   try {
     const item = await client.request<{ folder?: { childCount?: number } }>(
-      `${GRAPH_BASE}/me/drive/items/${encodeURIComponent(id)}?$select=id,folder`,
+      `${itemUrl(id)}?$select=id,folder`,
     );
     return { count: item.folder?.childCount ?? 0, capped: false };
   } catch {

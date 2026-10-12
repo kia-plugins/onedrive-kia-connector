@@ -106,6 +106,7 @@ import {
   type NetFetch,
 } from './client';
 import { buildDisplayPath } from './path-resolver';
+import { graphItemId, itemUrl, parseRef, siblingRef } from './item-ref';
 import { chooseRoute, statusFor, type OneDriveRoute } from './mime-route';
 import { countChildren, listChildFolders, listSharedRoots } from './tree';
 
@@ -383,10 +384,8 @@ function metadataItem(
  *  `@microsoft.graph.downloadUrl` is an OData annotation, and Graph's
  *  `$select` clause strips annotations even when listed explicitly — a bare
  *  GET returns the full driveItem with the annotation populated. */
-async function refreshDownloadUrl(client: GraphClient, itemId: string): Promise<string | undefined> {
-  const item = await client.request<{ '@microsoft.graph.downloadUrl'?: string }>(
-    `${GRAPH_BASE}/me/drive/items/${itemId}`,
-  );
+async function refreshDownloadUrl(client: GraphClient, ref: string): Promise<string | undefined> {
+  const item = await client.request<{ '@microsoft.graph.downloadUrl'?: string }>(itemUrl(ref));
   return item['@microsoft.graph.downloadUrl'];
 }
 
@@ -446,7 +445,7 @@ async function buildItem(
   // fall back to a fresh GET before giving up.
   let downloadUrl = raw['@microsoft.graph.downloadUrl'];
   if (!downloadUrl) {
-    downloadUrl = await refreshDownloadUrl(deps.client, raw.id);
+    downloadUrl = await refreshDownloadUrl(deps.client, siblingRef(root.rootFolderId, raw.id));
   }
   if (!downloadUrl) {
     return metadataItem(raw, 'failed', displayPath, root.rootFolderId);
@@ -457,7 +456,7 @@ async function buildItem(
     bytes = await downloadBytes(deps.fetchFn, downloadUrl);
   } catch (e) {
     if (e instanceof GraphApiError && e.status === 403) {
-      const refreshed = await refreshDownloadUrl(deps.client, raw.id);
+      const refreshed = await refreshDownloadUrl(deps.client, siblingRef(root.rootFolderId, raw.id));
       if (!refreshed) throw e;
       bytes = await downloadBytes(deps.fetchFn, refreshed);
     } else {
@@ -549,7 +548,7 @@ async function* pageChunks(
       deps.processed.add(raw.id);
       const existing = await deps.query.byExternalId(deps.session.account.id, raw.id, 'file');
       if (existing) deletions.push({ externalId: raw.id, type: 'file' });
-    } else if (!raw.file || raw.id === root.rootFolderId || deps.processed.has(raw.id)) {
+    } else if (!raw.file || raw.id === graphItemId(root.rootFolderId) || deps.processed.has(raw.id)) {
       // folder (not ingested, v1 parity) / the root item itself / overlapping
       // tracked roots — first root wins.
       continue;
@@ -606,15 +605,32 @@ function isResyncRequired(msg: string): boolean {
  *  the whole pull — which would stall every other root and, during a policy
  *  re-walk, keep the re-walk from ever completing. Its indexed rows stay
  *  until the user removes the folder under Manage folders. */
-function isRootGone(e: unknown): boolean {
-  return e instanceof GraphApiError && e.status === 404;
+function isRootGone(e: unknown, rootId: string): boolean {
+  return (e instanceof GraphApiError && e.status === 404) || isRootUnaddressable(e, rootId);
 }
 
-function skipGoneRoot(session: Session, root: RootConfig, gone: Set<string>): void {
+/** 400 invalidRequest ("The provided item ID is not valid for the requested
+ *  drive"): the root lives on another user's drive but is addressed on
+ *  `/me/drive` — a "Shared with me" folder saved by ≤2.3.1 as a bare id
+ *  (item-ref.ts). It can never succeed, so it is skipped like a gone root
+ *  instead of failing every pull; re-adding it from the picker stores the
+ *  drive-qualified id that works. */
+function isRootUnaddressable(e: unknown, rootId: string): boolean {
+  return (
+    e instanceof GraphApiError &&
+    e.status === 400 &&
+    parseRef(rootId).driveId === undefined &&
+    /not valid for the requested drive/i.test(e.message)
+  );
+}
+
+function skipGoneRoot(session: Session, root: RootConfig, gone: Set<string>, e: unknown): void {
   gone.add(root.rootFolderId);
   session.log(
     'warn',
-    `onedrive: tracked folder "${root.rootName}" (${root.rootFolderId}) no longer exists in OneDrive — skipped; remove it under Manage folders`,
+    isRootUnaddressable(e, root.rootFolderId)
+      ? `onedrive: tracked folder "${root.rootName}" (${root.rootFolderId}) is shared from another OneDrive and cannot be read as saved — skipped; remove it under Manage folders and add it again from "Shared with me"`
+      : `onedrive: tracked folder "${root.rootName}" (${root.rootFolderId}) no longer exists in OneDrive — skipped; remove it under Manage folders`,
   );
 }
 
@@ -767,7 +783,7 @@ async function* backfill(
     const resuming = i === startIdx && resumeNextLink;
     const startUrl = resuming
       ? resumeNextLink!
-      : `${GRAPH_BASE}/me/drive/items/${root.rootFolderId}/delta`;
+      : `${itemUrl(root.rootFolderId)}/delta`;
     // The cursor that fetched the CURRENT page — what an intermediate
     // (budget-flushed) chunk commits under, so a crash replays this page.
     let pageCursor: OneDriveCursor = {
@@ -801,8 +817,8 @@ async function* backfill(
         }
       }
     } catch (e) {
-      if (!isRootGone(e)) throw e;
-      skipGoneRoot(session, root, gone);
+      if (!isRootGone(e, root.rootFolderId)) throw e;
+      skipGoneRoot(session, root, gone, e);
       // Advance past it, tokenless: backfillDone stays false for it, so the
       // next pull re-probes it — and pull() polls the live roots meanwhile.
       yield { phase: more ? 'backfill' : 'live', items: [], cursor: doneCursor() };
@@ -820,7 +836,7 @@ async function* establishRootLive(
   deps: ItemDeps,
   deltaTokens: Record<string, string>,
 ): AsyncGenerator<Batch<OneDriveCursor, OneDriveItem>> {
-  const startUrl = `${GRAPH_BASE}/me/drive/items/${root.rootFolderId}/delta`;
+  const startUrl = `${itemUrl(root.rootFolderId)}/delta`;
   for await (const step of walkRootToDeltaLink(client, root, deps, startUrl, false)) {
     if (deps.session.signal.aborted) return;
     if (step.token != null) deltaTokens[root.rootFolderId] = step.token;
@@ -896,13 +912,13 @@ async function* delta(
     // root added later without one is caught by backfillDone and routed back
     // through backfill() instead (see module doc's self-heal note).
     const token = deltaTokens[root.rootFolderId]!;
-    const startUrl = `${GRAPH_BASE}/me/drive/items/${root.rootFolderId}/delta?token=${encodeURIComponent(token)}`;
+    const startUrl = `${itemUrl(root.rootFolderId)}/delta?token=${encodeURIComponent(token)}`;
     try {
       yield* pollRoot(client, root, deps, startUrl, deltaTokens);
     } catch (e) {
       if (isAuthError(e)) throw e;
-      if (isRootGone(e)) {
-        skipGoneRoot(session, root, gone);
+      if (isRootGone(e, root.rootFolderId)) {
+        skipGoneRoot(session, root, gone, e);
         continue;
       }
       if (!isResyncRequired(errText(e))) throw e;
@@ -913,8 +929,8 @@ async function* delta(
       try {
         yield* establishRootLive(client, root, deps, deltaTokens);
       } catch (e2) {
-        if (!isRootGone(e2)) throw e2;
-        skipGoneRoot(session, root, gone);
+        if (!isRootGone(e2, root.rootFolderId)) throw e2;
+        skipGoneRoot(session, root, gone, e2);
       }
     }
   }
@@ -941,11 +957,12 @@ const MY_DRIVE = 'me';
  * Resolve one tracked root to a comparable location, or `null` when it is
  * INCOMPARABLE — it can neither cover nor be covered by anything.
  *
- * `null` is returned for exactly two cases, both of which make archiving the
- * correct answer: a "Shared with me" root whose `parentReference.path` is
+ * `null` is returned for exactly three cases, all of which make archiving
+ * the correct answer: a "Shared with me" root whose `parentReference.path` is
  * absent or relative to a drive this connector never resolves (the same
- * limitation `buildDisplayPath` documents in path-resolver.ts), and a root
- * that is gone upstream (404/410).
+ * limitation `buildDisplayPath` documents in path-resolver.ts), a root that
+ * is gone upstream (404/410), and a pre-2.3.2 shared root saved as a bare id
+ * that its drive rejects (400 invalidRequest — it never synced anything).
  *
  * ANY OTHER failure RETHROWS, aborting the whole save — including a malformed
  * percent-escape out of `decodeURIComponent`, which is deliberately not
@@ -967,10 +984,12 @@ export async function resolveRootLocation(
   let item: RootItem;
   try {
     item = await client.request<RootItem>(
-      `${GRAPH_BASE}/me/drive/items/${encodeURIComponent(rootFolderId)}?$select=id,name,parentReference`,
+      `${itemUrl(rootFolderId)}?$select=id,name,parentReference`,
     );
   } catch (e) {
     if (e instanceof GraphApiError && (e.status === 404 || e.status === 410)) return null;
+    // A pre-2.3.2 shared root saved as a bare id: unreadable, incomparable.
+    if (isRootUnaddressable(e, rootFolderId)) return null;
     throw e;
   }
   const raw = item.parentReference?.path;
@@ -978,13 +997,17 @@ export async function resolveRootLocation(
   if (!raw || !name) return null;
   const mine = /^\/drive\/root:?/.exec(raw);
   const foreign = /^\/drives\/([^/]+)\/root:?/.exec(raw);
+  // Graph's `/drive/root:` is relative to the drive the item was REQUESTED
+  // on, so for a drive-qualified root it names the owner's drive, not ours:
+  // the encoded drive id is the identity there.
+  const qualified = parseRef(rootFolderId).driveId;
   let drive: string;
   let parent: string;
   if (mine) {
-    drive = MY_DRIVE;
+    drive = qualified ? qualified.toLowerCase() : MY_DRIVE;
     parent = raw.slice(mine[0].length);
   } else if (foreign) {
-    drive = foreign[1];
+    drive = foreign[1].toLowerCase();
     parent = raw.slice(foreign[0].length);
   } else {
     return null; // an unknown/relative path form — incomparable
@@ -1045,7 +1068,7 @@ export async function expandIdsFor(
     let item: Ref | null;
     try {
       item = await client.request<Ref>(
-        `${GRAPH_BASE}/me/drive/items/${encodeURIComponent(id)}?$select=id,name,parentReference`,
+        `${itemUrl(id)}?$select=id,name,parentReference`,
       );
     } catch {
       item = null;
@@ -1064,11 +1087,17 @@ export async function expandIdsFor(
       if (!raw) break;
       const mine = /^\/drive\/root:?/.exec(raw);
       if (!mine) break; // a shared/foreign drive — its ancestors are never listed
+      const shared = parseRef(sel.id).driveId !== undefined;
       if (raw.slice(mine[0].length).replace(/\/+$/, '') === '') {
-        out.add(ONEDRIVE_DRIVE_ROOT_ID);
+        // The owner's drive root of a shared folder is never a picker row.
+        if (!shared) out.add(ONEDRIVE_DRIVE_ROOT_ID);
         break;
       }
-      const parentId = ref?.id;
+      // A shared folder's ancestors live on its drive; keep the qualification
+      // so the walk's next GET and the emitted id match the picker's rows.
+      // Ancestors above the shared root are unlisted (or unreadable — the GET
+      // then fails and the walk stops); emitting them is harmless.
+      const parentId = ref?.id ? siblingRef(sel.id, ref.id) : undefined;
       if (!parentId || visited.has(parentId)) break; // unknown parent, or a cycle
       visited.add(parentId);
       out.add(parentId);
@@ -1351,7 +1380,9 @@ export function createOneDriveSource(
       if (route.kind === 'ignore' || route.bytes === 'none') return null;
       const client = clientFor(session);
       try {
-        const downloadUrl = await refreshDownloadUrl(client, itemId);
+        // A file under a shared root lives on that root's drive.
+        const rootId = typeof meta.root_folder_id === 'string' ? meta.root_folder_id : '';
+        const downloadUrl = await refreshDownloadUrl(client, siblingRef(rootId, itemId));
         if (!downloadUrl) return null;
         return await downloadBytes(host.net.fetch, downloadUrl);
       } catch (e) {

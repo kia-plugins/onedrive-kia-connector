@@ -28,7 +28,9 @@ export interface DisplayPathItem {
 export function buildDisplayPath(root: DisplayPathRoot, item: DisplayPathItem): string {
   const raw = item.parentReference?.path;
   if (!raw) return `${root.rootName} / ${item.name}`;
-  const stripped = raw.replace(/^\/drive\/root:?/, '');
+  // Own drive: `/drive/root:/…`; a shared folder's owner drive:
+  // `/drives/{driveId}/root:/…`.
+  const stripped = raw.replace(/^\/(?:drive|drives\/[^/]+)\/root:?/, '');
   const segments = stripped
     .split('/')
     .filter((s) => s.length > 0)
